@@ -12,7 +12,7 @@ import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs/promises';
-import path from 'node:path';
+import { timingSafeEqual, createHmac } from 'node:crypto';
 
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -54,7 +54,7 @@ function requireToken(req: Request, res: Response, next: NextFunction) {
   const supplied = header.startsWith('Bearer ') ? header.slice(7) : '';
   const a = Buffer.from(supplied);
   const b = Buffer.from(API_TOKEN);
-  if (a.length !== b.length || !require('node:crypto').timingSafeEqual(a, b)) {
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   next();
@@ -70,7 +70,7 @@ async function emitWebhook(event: string, details: Record<string, unknown> = {})
   try {
     const body = JSON.stringify({ event, occurred_at: new Date().toISOString(), ...details });
     const secret = process.env.WEBHOOK_SECRET || '';
-    const signature = (await import('node:crypto')).createHmac('sha256', secret).update(body).digest('hex');
+    const signature = createHmac('sha256', secret).update(body).digest('hex');
     await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-encontre-signature': signature }, body, signal: AbortSignal.timeout(8000) });
   } catch (error) {
     logger.warn({ error: safeError(error) }, 'Webhook delivery failed');
@@ -232,9 +232,6 @@ app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
     const self = metadata.participants.find(p => p.id === client.user?.id);
-    if (!self?.admin && !self?.admin === false) {
-      return res.status(403).json({ error: 'bot_must_be_group_admin' });
-    }
     if (!self?.admin) return res.status(403).json({ error: 'bot_must_be_group_admin' });
     const result = await client.groupParticipantsUpdate(req.params.groupId, [participant], 'remove');
     return res.json({ group_id: req.params.groupId, participant, result });
