@@ -1,0 +1,303 @@
+import 'dotenv/config';
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  WASocket,
+  BaileysEventMap,
+} from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import QRCode from 'qrcode';
+import pino from 'pino';
+import fs from 'node:fs/promises';
+import { timingSafeEqual, createHmac } from 'node:crypto';
+
+const app = express();
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '0.0.0.0';
+const API_TOKEN = process.env.API_TOKEN || '';
+const AUTH_DIR = process.env.AUTH_DIR || '/data/baileys-auth';
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
+
+if (API_TOKEN.length < 32) {
+  logger.error('API_TOKEN must contain at least 32 characters. Refusing to start.');
+  process.exit(1);
+}
+
+app.disable('x-powered-by');
+app.use(express.json({ limit: '32kb' }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin not allowed'));
+  },
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+}));
+
+type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'logged_out' | 'error';
+let sock: WASocket | null = null;
+let state: ConnectionState = 'disconnected';
+let qrText: string | null = null;
+let qrDataUrl: string | null = null;
+let pairingCode: string | null = null;
+let lastError: string | null = null;
+let reconnectTimer: NodeJS.Timeout | null = null;
+let starting = false;
+let reconnectAllowed = true;
+
+function requireToken(req: Request, res: Response, next: NextFunction) {
+  const header = req.header('authorization') || '';
+  const supplied = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(API_TOKEN);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
+function safeError(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 300) : 'Unknown error';
+}
+
+async function emitWebhook(event: string, details: Record<string, unknown> = {}) {
+  const url = process.env.WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const body = JSON.stringify({ event, occurred_at: new Date().toISOString(), ...details });
+    const secret = process.env.WEBHOOK_SECRET || '';
+    const signature = createHmac('sha256', secret).update(body).digest('hex');
+    await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-encontre-signature': signature }, body, signal: AbortSignal.timeout(8000) });
+  } catch (error) {
+    logger.warn({ error: safeError(error) }, 'Webhook delivery failed');
+  }
+}
+
+async function startSocket(forceFresh = false): Promise<void> {
+  if (starting) return;
+  starting = true;
+  state = 'connecting';
+  lastError = null;
+  try {
+    await fs.mkdir(AUTH_DIR, { recursive: true });
+    if (forceFresh) {
+      await fs.rm(AUTH_DIR, { recursive: true, force: true });
+      await fs.mkdir(AUTH_DIR, { recursive: true });
+    }
+    const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
+    const nextSocket = makeWASocket({
+      version,
+      auth: authState,
+      logger: logger.child({ component: 'baileys' }),
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+    });
+    sock = nextSocket;
+    nextSocket.ev.on('creds.update', saveCreds);
+    nextSocket.ev.on('connection.update', async (update) => {
+      if (update.qr) {
+        qrText = update.qr;
+        qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 2, width: 320 });
+        pairingCode = null;
+        state = 'connecting';
+        await emitWebhook('whatsapp.qr_ready');
+      }
+      if (update.connection === 'open') {
+        state = 'connected';
+        qrText = null;
+        qrDataUrl = null;
+        pairingCode = null;
+        lastError = null;
+        logger.info('WhatsApp session connected');
+        await emitWebhook('whatsapp.connected');
+      }
+      if (update.connection === 'close') {
+        const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        state = loggedOut ? 'logged_out' : 'disconnected';
+        sock = null;
+        logger.warn({ statusCode, loggedOut }, 'WhatsApp connection closed');
+        await emitWebhook('whatsapp.disconnected', { logged_out: loggedOut, status_code: statusCode });
+        if (!loggedOut && reconnectAllowed) {
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => void startSocket(), 5000);
+        }
+      }
+    });
+  } catch (error) {
+    state = 'error';
+    lastError = safeError(error);
+    logger.error({ error: lastError }, 'Could not start WhatsApp socket');
+    throw error;
+  } finally {
+    starting = false;
+  }
+}
+
+function connectedSocket(res: Response): WASocket | null {
+  if (!sock || state !== 'connected') {
+    res.status(409).json({ error: 'whatsapp_not_connected', state });
+    return null;
+  }
+  return sock;
+}
+
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
+app.use('/v1', requireToken);
+
+app.get('/v1/status', (_req, res) => res.json({
+  state,
+  connected: state === 'connected',
+  has_qr: Boolean(qrDataUrl),
+  has_pairing_code: Boolean(pairingCode),
+  last_error: lastError,
+  phone: sock?.user?.id?.split(':')[0] || null,
+}));
+
+app.post('/v1/connect', async (_req, res) => {
+  try {
+    if (state === 'connected') return res.json({ state, message: 'Already connected' });
+    reconnectAllowed = true;
+    await startSocket();
+    return res.status(202).json({ state: 'connecting', message: 'Connection started; poll /v1/qr or /v1/status' });
+  } catch (error) {
+    return res.status(500).json({ error: 'connection_start_failed', message: safeError(error) });
+  }
+});
+
+app.get('/v1/qr', (_req, res) => {
+  if (!qrDataUrl) return res.status(404).json({ error: 'qr_not_ready', state });
+  return res.json({ qr_data_url: qrDataUrl, expires_in_seconds: 45, state });
+});
+
+app.post('/v1/pairing-code', async (req, res) => {
+  const phone = String(req.body?.phone || '').replace(/\D/g, '');
+  if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'phone_must_include_country_code_digits_only' });
+  try {
+    if (!sock || state !== 'connecting') await startSocket();
+    if (!sock) return res.status(503).json({ error: 'socket_not_ready' });
+    const code = await sock.requestPairingCode(phone);
+    pairingCode = code;
+    qrText = null;
+    qrDataUrl = null;
+    return res.json({ pairing_code: code, state: 'connecting', instructions: 'Enter this code in WhatsApp > Linked devices > Link with phone number' });
+  } catch (error) {
+    return res.status(500).json({ error: 'pairing_code_failed', message: safeError(error) });
+  }
+});
+
+app.get('/v1/groups', async (_req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  try {
+    const groups = await client.groupFetchAllParticipating();
+    return res.json({ groups: Object.values(groups).map(group => ({
+      id: group.id, subject: group.subject, description: group.desc || null,
+      owner: group.owner || null, size: group.participants?.length || 0,
+    })) });
+  } catch (error) {
+    return res.status(502).json({ error: 'groups_fetch_failed', message: safeError(error) });
+  }
+});
+
+app.get('/v1/groups/:groupId/participants', async (req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  try {
+    const metadata = await client.groupMetadata(req.params.groupId);
+    return res.json({ group_id: metadata.id, participants: metadata.participants.map(p => ({
+      id: p.id, admin: p.admin || null,
+    })) });
+  } catch (error) {
+    return res.status(502).json({ error: 'participants_fetch_failed', message: safeError(error) });
+  }
+});
+
+app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  const participant = String(req.body?.participant || '');
+  if (!participant || participant.length > 100 || !/^\d+(@s\.whatsapp\.net|@lid)$/.test(participant)) {
+    return res.status(400).json({ error: 'invalid_participant_id' });
+  }
+  try {
+    const metadata = await client.groupMetadata(req.params.groupId);
+    const self = metadata.participants.find(p => p.id === client.user?.id);
+    if (!self?.admin) return res.status(403).json({ error: 'bot_must_be_group_admin' });
+    const result = await client.groupParticipantsUpdate(req.params.groupId, [participant], 'remove');
+    return res.json({ group_id: req.params.groupId, participant, result });
+  } catch (error) {
+    return res.status(502).json({ error: 'participant_removal_failed', message: safeError(error) });
+  }
+});
+
+app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  const phone = String(req.body?.phone || '').replace(/\D/g, '');
+  if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'invalid_phone' });
+  try {
+    const metadata = await client.groupMetadata(req.params.groupId);
+    const self = metadata.participants.find(p => p.id === client.user?.id);
+    if (!self?.admin) return res.status(403).json({ error: 'bot_must_be_group_admin' });
+    const result = await client.groupParticipantsUpdate(req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
+    return res.json({ group_id: req.params.groupId, phone, result });
+  } catch (error) {
+    return res.status(502).json({ error: 'participant_addition_failed', message: safeError(error) });
+  }
+});
+
+app.post('/v1/disconnect', async (_req, res) => {
+  reconnectAllowed = false;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  try { sock?.end(undefined); } catch { /* socket may already be closed */ }
+  sock = null;
+  state = 'disconnected';
+  qrText = null; qrDataUrl = null; pairingCode = null;
+  await emitWebhook('whatsapp.manual_disconnect');
+  return res.json({ state });
+});
+
+app.post('/v1/logout', async (_req, res) => {
+  reconnectAllowed = false;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  try { await sock?.logout(); } catch { /* continue clearing local credentials */ }
+  sock = null;
+  state = 'logged_out';
+  qrText = null; qrDataUrl = null; pairingCode = null;
+  await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  return res.json({ state, message: 'Session logged out and local auth data removed' });
+});
+
+app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  logger.error({ error: safeError(error) }, 'Unhandled request error');
+  res.status(500).json({ error: 'internal_server_error' });
+});
+
+const server = app.listen(PORT, HOST, () => {
+  logger.info({ host: HOST, port: PORT }, 'Encontre + Baileys service listening');
+  void fs.mkdir(AUTH_DIR, { recursive: true }).then(() => startSocket()).catch(error => {
+    logger.error({ error: safeError(error) }, 'Initial WhatsApp startup failed; use /v1/connect to retry');
+  });
+});
+
+process.on('SIGTERM', () => {
+  reconnectAllowed = false;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  try { sock?.end(undefined); } catch { /* ignore */ }
+  server.close(() => process.exit(0));
+});
+process.on('SIGINT', () => {
+  reconnectAllowed = false;
+  try { sock?.end(undefined); } catch { /* ignore */ }
+  server.close(() => process.exit(0));
+});
