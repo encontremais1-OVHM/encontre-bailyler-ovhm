@@ -20,8 +20,8 @@ WORKDIR /app
 
 # Railway mounts volumes as root-owned; prepare the mount at container startup,
 # then drop privileges before running the WhatsApp service.
-RUN apt-get update \\
-    && apt-get install -y --no-install-recommends gosu \\
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
