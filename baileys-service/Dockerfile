@@ -18,12 +18,17 @@ FROM node:20-bookworm-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Railway mounts volumes as root-owned; prepare the mount at container startup,
+# then drop privileges before running the WhatsApp service.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package*.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 
 RUN mkdir -p /data/baileys-auth && chown -R node:node /data
-USER node
 
 EXPOSE 3000
-CMD ["node", "dist/index.js"]
+CMD ["sh", "-c", "chown -R node:node /data && exec gosu node node dist/index.js"]
