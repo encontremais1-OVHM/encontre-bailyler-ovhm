@@ -227,8 +227,10 @@ app.get('/v1/communities', async (_req, res) => {
       client.communityFetchAllParticipating(),
       client.groupFetchAllParticipating(),
     ]);
-    const result = await Promise.all(Object.values(communities).map(async community => {
-      const linkedGroups = Object.values(groups).filter(group =>
+    const communityEntries = Object.values(communities) as any[];
+    const groupEntries = Object.values(groups) as any[];
+    const result = await Promise.all(communityEntries.map(async (community: any) => {
+      const linkedGroups = groupEntries.filter((group: any) =>
         group.linkedParent === community.id && !group.isCommunityAnnounce
       );
       const [imageUrl, inviteCode, subgroups] = await Promise.all([
