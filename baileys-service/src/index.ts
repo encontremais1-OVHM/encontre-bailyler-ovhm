@@ -78,7 +78,7 @@ async function emitWebhook(event: string, details: Record<string, unknown> = {})
 }
 
 async function startSocket(forceFresh = false): Promise<void> {
-  if (starting) return;
+  if (starting || (sock && (state === 'connecting' || state === 'connected'))) return;
   starting = true;
   state = 'connecting';
   lastError = null;
@@ -151,6 +151,15 @@ function connectedSocket(res: Response): WASocket | null {
   return sock;
 }
 
+function jidUser(value: string | undefined): string {
+  return String(value || '').split(':')[0].split('@')[0];
+}
+
+function isConnectedAccountAdmin(participants: Array<{ id: string; admin?: string | null }>, client: WASocket): boolean {
+  const self = jidUser(client.user?.id);
+  return Boolean(self && participants.some((participant) => jidUser(participant.id) === self && Boolean(participant.admin)));
+}
+
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
 app.use('/v1', requireToken);
 
@@ -166,6 +175,7 @@ app.get('/v1/status', (_req, res) => res.json({
 app.post('/v1/connect', async (_req, res) => {
   try {
     if (state === 'connected') return res.json({ state, message: 'Already connected' });
+    if (state === 'connecting' && sock) return res.status(202).json({ state: 'connecting', message: 'Connection already in progress; poll /v1/qr or /v1/status' });
     reconnectAllowed = true;
     await startSocket();
     return res.status(202).json({ state: 'connecting', message: 'Connection started; poll /v1/qr or /v1/status' });
@@ -222,6 +232,22 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
   }
 });
 
+app.get('/v1/groups/:groupId/invite-link', async (req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  try {
+    const metadata = await client.groupMetadata(req.params.groupId);
+    if (!isConnectedAccountAdmin(metadata.participants, client)) {
+      return res.status(403).json({ error: 'bot_must_be_group_admin' });
+    }
+    const code = await client.groupInviteCode(req.params.groupId);
+    if (!code) return res.status(404).json({ error: 'group_invite_link_unavailable' });
+    return res.json({ group_id: req.params.groupId, invite_link: `https://chat.whatsapp.com/${code}` });
+  } catch (error) {
+    return res.status(502).json({ error: 'invite_link_fetch_failed', message: safeError(error) });
+  }
+});
+
 app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
@@ -231,9 +257,11 @@ app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
   }
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
-    const self = metadata.participants.find(p => p.id === client.user?.id);
-    if (!self?.admin) return res.status(403).json({ error: 'bot_must_be_group_admin' });
+    if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
     const result = await client.groupParticipantsUpdate(req.params.groupId, [participant], 'remove');
+    if (result.some((item) => String(item.status) !== '200')) {
+      return res.status(502).json({ error: 'participant_removal_not_confirmed', result });
+    }
     return res.json({ group_id: req.params.groupId, participant, result });
   } catch (error) {
     return res.status(502).json({ error: 'participant_removal_failed', message: safeError(error) });
@@ -247,9 +275,11 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
   if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'invalid_phone' });
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
-    const self = metadata.participants.find(p => p.id === client.user?.id);
-    if (!self?.admin) return res.status(403).json({ error: 'bot_must_be_group_admin' });
+    if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
     const result = await client.groupParticipantsUpdate(req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
+    if (result.some((item) => String(item.status) !== '200')) {
+      return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
+    }
     return res.json({ group_id: req.params.groupId, phone, result });
   } catch (error) {
     return res.status(502).json({ error: 'participant_addition_failed', message: safeError(error) });
