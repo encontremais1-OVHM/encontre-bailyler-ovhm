@@ -232,6 +232,22 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
   }
 });
 
+app.get('/v1/groups/:groupId/invite-link', async (req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  try {
+    const metadata = await client.groupMetadata(req.params.groupId);
+    if (!isConnectedAccountAdmin(metadata.participants, client)) {
+      return res.status(403).json({ error: 'bot_must_be_group_admin' });
+    }
+    const code = await client.groupInviteCode(req.params.groupId);
+    if (!code) return res.status(404).json({ error: 'group_invite_link_unavailable' });
+    return res.json({ group_id: req.params.groupId, invite_link: `https://chat.whatsapp.com/${code}` });
+  } catch (error) {
+    return res.status(502).json({ error: 'invite_link_fetch_failed', message: safeError(error) });
+  }
+});
+
 app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
