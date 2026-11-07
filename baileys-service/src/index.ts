@@ -229,7 +229,28 @@ app.get('/v1/communities', async (_req, res) => {
     ]);
     const communityEntries = Object.values(communities) as any[];
     const groupEntries = Object.values(groups) as any[];
-    const result = await Promise.all(communityEntries.map(async (community: any) => {
+
+    // Baileys 6.7.24 can return an empty "communities" collection because
+    // its community parser expects <communities>/<community>, while WhatsApp
+    // may return the parent container as a normal <group>. The group parser
+    // exposes that container reliably through isCommunity.
+    const discoveredCommunities = new Map<string, any>();
+    for (const community of communityEntries) {
+      if (community?.id) discoveredCommunities.set(community.id, community);
+    }
+    for (const group of groupEntries) {
+      if (group?.id && group.isCommunity && !group.isCommunityAnnounce) {
+        discoveredCommunities.set(group.id, group);
+      }
+    }
+    const allCommunities = [...discoveredCommunities.values()];
+    logger.info({
+      community_api_results: communityEntries.length,
+      group_api_results: groupEntries.length,
+      detected_communities: allCommunities.length,
+    }, 'WhatsApp communities discovered');
+
+    const result = await Promise.all(allCommunities.map(async (community: any) => {
       const linkedGroups = groupEntries.filter((group: any) =>
         group.linkedParent === community.id && !group.isCommunityAnnounce
       );
