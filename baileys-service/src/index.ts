@@ -219,6 +219,76 @@ app.get('/v1/groups', async (_req, res) => {
   }
 });
 
+app.get('/v1/communities', async (_req, res) => {
+  const client = connectedSocket(res) as any;
+  if (!client) return;
+  try {
+    const [communities, groups] = await Promise.all([
+      client.communityFetchAllParticipating(),
+      client.groupFetchAllParticipating(),
+    ]);
+    const communityEntries = Object.values(communities) as any[];
+    const groupEntries = Object.values(groups) as any[];
+    const result = await Promise.all(communityEntries.map(async (community: any) => {
+      const linkedGroups = groupEntries.filter((group: any) =>
+        group.linkedParent === community.id && !group.isCommunityAnnounce
+      );
+      const [imageUrl, inviteCode, subgroups] = await Promise.all([
+        client.profilePictureUrl(community.id, 'image').catch(() => null),
+        client.communityInviteCode(community.id).catch(() => null),
+        Promise.all(linkedGroups.map(async group => ({
+          id: group.id,
+          subject: group.subject,
+          description: group.desc || null,
+          size: group.size || group.participants?.length || 0,
+          linked_parent_id: group.linkedParent || community.id,
+          is_community_announcement: Boolean(group.isCommunityAnnounce),
+          profile_picture_url: await client.profilePictureUrl(group.id, 'image').catch(() => null),
+        }))),
+      ]);
+      return {
+        id: community.id,
+        subject: community.subject,
+        description: community.desc || null,
+        size: community.size || community.participants?.length || 0,
+        profile_picture_url: imageUrl,
+        invite_link: inviteCode ? `https://chat.whatsapp.com/${inviteCode}` : null,
+        subgroups,
+      };
+    }));
+    return res.json({ communities: result });
+  } catch (error) {
+    return res.status(502).json({ error: 'communities_fetch_failed', message: safeError(error) });
+  }
+});
+
+app.post('/v1/communities/:communityId/participants/:action', async (req, res) => {
+  const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
+  if (!client) return;
+  const action = req.params.action;
+  if (action !== 'add' && action !== 'remove') {
+    return res.status(400).json({ error: 'invalid_community_participant_action' });
+  }
+  const phone = String(req.body?.phone || '').replace(/\D/g, '');
+  const participant = action === 'remove' ? String(req.body?.participant || '') : `${phone}@s.whatsapp.net`;
+  if (!participant || participant.length > 100 || !/^[0-9]+@s\.whatsapp\.net$/.test(participant)) {
+    return res.status(400).json({ error: 'invalid_participant_id' });
+  }
+  try {
+    const metadata = await client.communityMetadata(req.params.communityId);
+    if (!isConnectedAccountAdmin(metadata.participants, client)) {
+      return res.status(403).json({ error: 'bot_must_be_community_admin' });
+    }
+    const result = await client.communityParticipantsUpdate(req.params.communityId, [participant], action);
+    if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
+      return res.status(502).json({ error: 'community_participant_update_not_confirmed', result });
+    }
+    return res.json({ community_id: req.params.communityId, participant, action, result });
+  } catch (error) {
+    return res.status(502).json({ error: `community_participant_${action}_failed`, message: safeError(error) });
+  }
+});
+
 app.get('/v1/groups/:groupId/participants', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
