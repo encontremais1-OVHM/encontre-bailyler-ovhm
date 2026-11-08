@@ -209,9 +209,11 @@ function jidUser(value: string | undefined): string {
   return String(value || '').split(':')[0].split('@')[0];
 }
 
-function isConnectedAccountAdmin(participants: Array<{ id: string; admin?: string | null }>, client: WASocket): boolean {
-  const self = jidUser(client.user?.id);
-  return Boolean(self && participants.some((participant) => jidUser(participant.id) === self && Boolean(participant.admin)));
+function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string; admin?: string | null }>, client: WASocket): boolean {
+  const self = jidUser(client.user?.jid || client.user?.id);
+  return Boolean(self && participants.some((participant) =>
+    (jidUser(participant.id) === self || jidUser(participant.jid) === self) && Boolean(participant.admin)
+  ));
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
@@ -366,8 +368,9 @@ app.get('/v1/communities/:communityId/participants', async (req, res) => {
     const metadata = await client.communityMetadata(req.params.communityId);
     return res.json({
       community_id: req.params.communityId,
-      participants: (metadata.participants || []).map((participant: { id: string; admin?: string | null }) => ({
+      participants: (metadata.participants || []).map((participant: { id: string; jid?: string; admin?: string | null }) => ({
         id: participant.id,
+        jid: participant.jid || null,
         admin: participant.admin || null,
       })),
     });
@@ -409,7 +412,7 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
     return res.json({ group_id: metadata.id, participants: metadata.participants.map(p => ({
-      id: p.id, admin: p.admin || null,
+      id: p.id, jid: p.jid || null, admin: p.admin || null,
     })) });
   } catch (error) {
     return res.status(502).json({ error: 'participants_fetch_failed', message: safeError(error) });
