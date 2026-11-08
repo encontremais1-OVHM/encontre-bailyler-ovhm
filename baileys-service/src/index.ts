@@ -210,7 +210,7 @@ function jidUser(value: string | undefined): string {
 }
 
 function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string; admin?: string | null }>, client: WASocket): boolean {
-  const self = jidUser(client.user?.id);
+  const self = jidUser(client.user?.jid || client.user?.id);
   return Boolean(self && participants.some((participant) =>
     (jidUser(participant.id) === self || jidUser(participant.jid) === self) && Boolean(participant.admin)
   ));
