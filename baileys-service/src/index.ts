@@ -48,6 +48,7 @@ let lastError: string | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let startPromise: Promise<void> | null = null;
 let reconnectAllowed = true;
+let reconnectAttempts = 0;
 
 function requireToken(req: Request, res: Response, next: NextFunction) {
   const header = req.header('authorization') || '';
@@ -119,6 +120,8 @@ async function startSocket(forceFresh = false): Promise<void> {
           qrDataUrl = null;
           pairingCode = null;
           lastError = null;
+          reconnectAttempts = 0;
+          reconnectTimer = null;
           logger.info('WhatsApp session connected');
           await emitWebhook('whatsapp.connected');
         }
@@ -132,6 +135,11 @@ async function startSocket(forceFresh = false): Promise<void> {
           qrText = null;
           qrDataUrl = null;
           pairingCode = null;
+          lastError = statusCode === 403
+            ? 'WhatsApp recusou a sessão (403); pode ser necessário voltar a vincular o dispositivo.'
+            : statusCode
+              ? `WhatsApp desconectou (código ${statusCode}).`
+              : 'WhatsApp desconectou sem informar um código.';
           logger.warn({ statusCode, loggedOut }, 'WhatsApp connection closed');
           await emitWebhook('whatsapp.disconnected', { logged_out: loggedOut, status_code: statusCode });
           if (loggedOut) {
@@ -141,7 +149,10 @@ async function startSocket(forceFresh = false): Promise<void> {
             });
           } else if (reconnectAllowed) {
             if (reconnectTimer) clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(() => void startSocket(), 5000);
+            reconnectAttempts += 1;
+            const delayMs = Math.min(5 * 60 * 1000, 5000 * (2 ** Math.min(reconnectAttempts - 1, 6)));
+            logger.warn({ reconnectAttempts, reconnectInMs: delayMs, statusCode }, 'Scheduling WhatsApp reconnection');
+            reconnectTimer = setTimeout(() => void startSocket(), delayMs);
           }
         }
       });
