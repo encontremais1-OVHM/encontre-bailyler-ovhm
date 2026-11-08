@@ -209,9 +209,11 @@ function jidUser(value: string | undefined): string {
   return String(value || '').split(':')[0].split('@')[0];
 }
 
-function isConnectedAccountAdmin(participants: Array<{ id: string; admin?: string | null }>, client: WASocket): boolean {
+function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string; admin?: string | null }>, client: WASocket): boolean {
   const self = jidUser(client.user?.id);
-  return Boolean(self && participants.some((participant) => jidUser(participant.id) === self && Boolean(participant.admin)));
+  return Boolean(self && participants.some((participant) =>
+    (jidUser(participant.id) === self || jidUser(participant.jid) === self) && Boolean(participant.admin)
+  ));
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
