@@ -46,7 +46,7 @@ let qrDataUrl: string | null = null;
 let pairingCode: string | null = null;
 let lastError: string | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
-let starting = false;
+let startPromise: Promise<void> | null = null;
 let reconnectAllowed = true;
 
 function requireToken(req: Request, res: Response, next: NextFunction) {
@@ -78,69 +78,108 @@ async function emitWebhook(event: string, details: Record<string, unknown> = {})
 }
 
 async function startSocket(forceFresh = false): Promise<void> {
-  if (starting || (sock && (state === 'connecting' || state === 'connected'))) return;
-  starting = true;
-  state = 'connecting';
-  lastError = null;
-  try {
-    await fs.mkdir(AUTH_DIR, { recursive: true });
-    if (forceFresh) {
-      await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  if (startPromise) return startPromise;
+  if (sock && (state === 'connecting' || state === 'connected')) return;
+
+  const operation = (async () => {
+    state = 'connecting';
+    lastError = null;
+    try {
       await fs.mkdir(AUTH_DIR, { recursive: true });
-    }
-    const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
-    const nextSocket = makeWASocket({
-      version,
-      auth: authState,
-      logger: logger.child({ component: 'baileys' }),
-      printQRInTerminal: false,
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      generateHighQualityLinkPreview: false,
-      connectTimeoutMs: 60_000,
-      defaultQueryTimeoutMs: 60_000,
-    });
-    sock = nextSocket;
-    nextSocket.ev.on('creds.update', saveCreds);
-    nextSocket.ev.on('connection.update', async (update) => {
-      if (update.qr) {
-        qrText = update.qr;
-        qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 2, width: 320 });
-        pairingCode = null;
-        state = 'connecting';
-        await emitWebhook('whatsapp.qr_ready');
+      if (forceFresh) {
+        await fs.rm(AUTH_DIR, { recursive: true, force: true });
+        await fs.mkdir(AUTH_DIR, { recursive: true });
       }
-      if (update.connection === 'open') {
-        state = 'connected';
-        qrText = null;
-        qrDataUrl = null;
-        pairingCode = null;
-        lastError = null;
-        logger.info('WhatsApp session connected');
-        await emitWebhook('whatsapp.connected');
-      }
-      if (update.connection === 'close') {
-        const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-        state = loggedOut ? 'logged_out' : 'disconnected';
-        sock = null;
-        logger.warn({ statusCode, loggedOut }, 'WhatsApp connection closed');
-        await emitWebhook('whatsapp.disconnected', { logged_out: loggedOut, status_code: statusCode });
-        if (!loggedOut && reconnectAllowed) {
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => void startSocket(), 5000);
+      const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      const { version } = await fetchLatestBaileysVersion();
+      const nextSocket = makeWASocket({
+        version,
+        auth: authState,
+        logger: logger.child({ component: 'baileys' }),
+        printQRInTerminal: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        generateHighQualityLinkPreview: false,
+        connectTimeoutMs: 60_000,
+        defaultQueryTimeoutMs: 60_000,
+      });
+      sock = nextSocket;
+      nextSocket.ev.on('creds.update', saveCreds);
+      nextSocket.ev.on('connection.update', async (update) => {
+        if (update.qr) {
+          qrText = update.qr;
+          qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 2, width: 320 });
+          pairingCode = null;
+          state = 'connecting';
+          await emitWebhook('whatsapp.qr_ready');
         }
-      }
-    });
-  } catch (error) {
-    state = 'error';
-    lastError = safeError(error);
-    logger.error({ error: lastError }, 'Could not start WhatsApp socket');
-    throw error;
+        if (update.connection === 'open') {
+          state = 'connected';
+          qrText = null;
+          qrDataUrl = null;
+          pairingCode = null;
+          lastError = null;
+          logger.info('WhatsApp session connected');
+          await emitWebhook('whatsapp.connected');
+        }
+        if (update.connection === 'close') {
+          const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+          const loggedOut = statusCode === DisconnectReason.loggedOut;
+          // Ignore close events from sockets that were intentionally replaced.
+          if (sock !== nextSocket) return;
+          sock = null;
+          state = loggedOut ? 'logged_out' : 'disconnected';
+          qrText = null;
+          qrDataUrl = null;
+          pairingCode = null;
+          logger.warn({ statusCode, loggedOut }, 'WhatsApp connection closed');
+          await emitWebhook('whatsapp.disconnected', { logged_out: loggedOut, status_code: statusCode });
+          if (loggedOut) {
+            // A logged-out session cannot be reused to link another number.
+            await fs.rm(AUTH_DIR, { recursive: true, force: true }).catch((error) => {
+              logger.warn({ error: safeError(error) }, 'Could not clear logged-out WhatsApp credentials');
+            });
+          } else if (reconnectAllowed) {
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => void startSocket(), 5000);
+          }
+        }
+      });
+    } catch (error) {
+      state = 'error';
+      lastError = safeError(error);
+      logger.error({ error: lastError }, 'Could not start WhatsApp socket');
+      throw error;
+    }
+  })();
+
+  startPromise = operation;
+  try {
+    await operation;
   } finally {
-    starting = false;
+    if (startPromise === operation) startPromise = null;
   }
+}
+
+function waitForPairingTransport(client: WASocket, timeoutMs = 20_000): Promise<void> {
+  if (qrText || state === 'connected') return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const finish = (error?: Error) => {
+      clearTimeout(timeout);
+      client.ev.off('connection.update', onUpdate);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onUpdate = (update: BaileysEventMap['connection.update']) => {
+      if (update.qr || update.connection === 'open') finish();
+      else if (update.connection === 'close') {
+        const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+        finish(new Error(`WhatsApp closed the connection before pairing was ready (status ${statusCode || 'unknown'}).`));
+      }
+    };
+    const timeout = setTimeout(() => finish(new Error('Timed out waiting for WhatsApp pairing transport.')), timeoutMs);
+    client.ev.on('connection.update', onUpdate);
+  });
 }
 
 function connectedSocket(res: Response): WASocket | null {
@@ -177,7 +216,7 @@ app.post('/v1/connect', async (_req, res) => {
     if (state === 'connected') return res.json({ state, message: 'Already connected' });
     if (state === 'connecting' && sock) return res.status(202).json({ state: 'connecting', message: 'Connection already in progress; poll /v1/qr or /v1/status' });
     reconnectAllowed = true;
-    await startSocket();
+    await startSocket(state === 'logged_out');
     return res.status(202).json({ state: 'connecting', message: 'Connection started; poll /v1/qr or /v1/status' });
   } catch (error) {
     return res.status(500).json({ error: 'connection_start_failed', message: safeError(error) });
@@ -193,15 +232,37 @@ app.post('/v1/pairing-code', async (req, res) => {
   const phone = String(req.body?.phone || '').replace(/\D/g, '');
   if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'phone_must_include_country_code_digits_only' });
   try {
-    if (!sock || state !== 'connecting') await startSocket();
-    if (!sock) return res.status(503).json({ error: 'socket_not_ready' });
-    const code = await sock.requestPairingCode(phone);
+    if (state === 'connected') {
+      return res.status(409).json({ error: 'whatsapp_already_connected', message: 'Desconecte a conta atual antes de vincular outro número.' });
+    }
+
+    // Pairing a different number must never reuse credentials from the previous account.
+    reconnectAllowed = false;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    const previousSocket = sock;
+    sock = null;
+    if (previousSocket) {
+      try { previousSocket.end(undefined); } catch { /* socket may already be closed */ }
+    }
+    qrText = null;
+    qrDataUrl = null;
+    pairingCode = null;
+    await fs.rm(AUTH_DIR, { recursive: true, force: true });
+    await startSocket(true);
+
+    const pairingSocket = sock;
+    if (!pairingSocket) return res.status(503).json({ error: 'socket_not_ready' });
+    reconnectAllowed = true;
+    await waitForPairingTransport(pairingSocket);
+    const code = await pairingSocket.requestPairingCode(phone);
     pairingCode = code;
     qrText = null;
     qrDataUrl = null;
     return res.json({ pairing_code: code, state: 'connecting', instructions: 'Enter this code in WhatsApp > Linked devices > Link with phone number' });
   } catch (error) {
-    return res.status(500).json({ error: 'pairing_code_failed', message: safeError(error) });
+    lastError = safeError(error);
+    logger.error({ error: lastError }, 'Could not generate WhatsApp pairing code');
+    return res.status(500).json({ error: 'pairing_code_failed', message: lastError });
   }
 });
 
@@ -380,12 +441,19 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
 app.post('/v1/disconnect', async (_req, res) => {
   reconnectAllowed = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  try { sock?.end(undefined); } catch { /* socket may already be closed */ }
+  const currentSocket = sock;
   sock = null;
-  state = 'disconnected';
-  qrText = null; qrDataUrl = null; pairingCode = null;
+  try { await currentSocket?.logout(); } catch {
+    try { currentSocket?.end(undefined); } catch { /* socket may already be closed */ }
+  }
+  await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  state = 'logged_out';
+  qrText = null;
+  qrDataUrl = null;
+  pairingCode = null;
+  lastError = null;
   await emitWebhook('whatsapp.manual_disconnect');
-  return res.json({ state });
+  return res.json({ state, message: 'WhatsApp disconnected and local credentials cleared. A new number can now be linked.' });
 });
 
 app.post('/v1/logout', async (_req, res) => {
