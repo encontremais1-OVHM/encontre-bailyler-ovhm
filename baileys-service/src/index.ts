@@ -182,6 +182,10 @@ function waitForPairingTransport(client: WASocket, timeoutMs = 20_000): Promise<
   });
 }
 
+function currentSocket(): WASocket | null {
+  return sock;
+}
+
 function connectedSocket(res: Response): WASocket | null {
   if (!sock || state !== 'connected') {
     res.status(409).json({ error: 'whatsapp_not_connected', state });
@@ -250,7 +254,7 @@ app.post('/v1/pairing-code', async (req, res) => {
     await fs.rm(AUTH_DIR, { recursive: true, force: true });
     await startSocket(true);
 
-    const pairingSocket = sock;
+    const pairingSocket = currentSocket();
     if (!pairingSocket) return res.status(503).json({ error: 'socket_not_ready' });
     reconnectAllowed = true;
     await waitForPairingTransport(pairingSocket);
