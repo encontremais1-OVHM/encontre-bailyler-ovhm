@@ -348,6 +348,23 @@ app.get('/v1/communities', async (_req, res) => {
   }
 });
 
+app.get('/v1/communities/:communityId/participants', async (req, res) => {
+  const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
+  if (!client) return;
+  try {
+    const metadata = await client.communityMetadata(req.params.communityId);
+    return res.json({
+      community_id: req.params.communityId,
+      participants: (metadata.participants || []).map((participant: { id: string; admin?: string | null }) => ({
+        id: participant.id,
+        admin: participant.admin || null,
+      })),
+    });
+  } catch (error) {
+    return res.status(502).json({ error: 'community_participants_fetch_failed', message: safeError(error) });
+  }
+});
+
 app.post('/v1/communities/:communityId/participants/:action', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
