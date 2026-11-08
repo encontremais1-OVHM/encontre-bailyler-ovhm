@@ -125,7 +125,9 @@ async function startSocket(forceFresh = false): Promise<void> {
         if (update.connection === 'close') {
           const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
           const loggedOut = statusCode === DisconnectReason.loggedOut;
-          if (sock === nextSocket) sock = null;
+          // Ignore close events from sockets that were intentionally replaced.
+          if (sock !== nextSocket) return;
+          sock = null;
           state = loggedOut ? 'logged_out' : 'disconnected';
           qrText = null;
           qrDataUrl = null;
