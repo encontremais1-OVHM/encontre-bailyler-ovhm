@@ -100,6 +100,7 @@ async function startSocket(forceFresh = false): Promise<void> {
         await fs.mkdir(AUTH_DIR, { recursive: true });
       }
       const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      const hasRegisteredSession = Boolean(authState.creds.registered);
       const { version } = await fetchLatestBaileysVersion();
       const nextSocket = makeWASocket({
         version,
@@ -176,6 +177,16 @@ async function startSocket(forceFresh = false): Promise<void> {
             await fs.rm(AUTH_DIR, { recursive: true, force: true }).catch((error) => {
               logger.warn({ error: safeError(error) }, 'Could not clear logged-out WhatsApp credentials');
             });
+          } else if (statusCode === 408 && !hasRegisteredSession) {
+            // Baileys 408 here means its QR reference attempts expired before
+            // pairing. Reconnecting blindly creates an endless QR timeout loop.
+            reconnectAllowed = false;
+            state = 'disconnected';
+            qrText = null;
+            qrDataUrl = null;
+            qrExpiresAt = null;
+            lastError = 'O QR expirou antes da leitura. Solicite um novo QR Code no Superadmin.';
+            logger.warn('Unpaired QR session expired; waiting for an explicit new connect request');
           } else if (reconnectAllowed) {
             if (reconnectTimer) clearTimeout(reconnectTimer);
             reconnectAttempts += 1;
@@ -611,7 +622,16 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, HOST, () => {
   logger.info({ host: HOST, port: PORT }, 'Encontre + Baileys service listening');
-  void fs.mkdir(AUTH_DIR, { recursive: true }).then(() => startSocket()).catch(error => {
+  void fs.mkdir(AUTH_DIR, { recursive: true }).then(async () => {
+    const { state: authState } = await useMultiFileAuthState(AUTH_DIR);
+    if (authState.creds.registered) {
+      logger.info('Persisted WhatsApp session found; restoring connection');
+      await startSocket();
+    } else {
+      state = 'disconnected';
+      logger.info('No paired WhatsApp session found; waiting for an explicit connection request');
+    }
+  }).catch(error => {
     logger.error({ error: safeError(error) }, 'Initial WhatsApp startup failed; use /v1/connect to retry');
   });
 });
