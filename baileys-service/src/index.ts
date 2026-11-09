@@ -291,10 +291,10 @@ function jidUser(value: string | undefined): string {
   return String(value || '').split(':')[0].split('@')[0];
 }
 
-function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string; admin?: string | null }>, client: WASocket): boolean {
+function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string; phoneNumber?: string; admin?: string | null }>, client: WASocket): boolean {
   const self = jidUser(client.user?.jid || client.user?.id);
   return Boolean(self && participants.some((participant) =>
-    (jidUser(participant.id) === self || jidUser(participant.jid) === self) && Boolean(participant.admin)
+    (jidUser(participant.id) === self || jidUser(participant.jid) === self || jidUser(participant.phoneNumber) === self) && Boolean(participant.admin)
   ));
 }
 
@@ -500,7 +500,9 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
   }
 });
 
-async function participantPhoneJid(client: any, participant: { id: string; jid?: string | null }): Promise<string | null> {
+async function participantPhoneJid(client: any, participant: { id: string; jid?: string | null; phoneNumber?: string | null }): Promise<string | null> {
+  const phoneNumber = String(participant.phoneNumber || '');
+  if (phoneNumber.endsWith('@s.whatsapp.net')) return phoneNumber;
   const supplied = String(participant.jid || participant.id || '');
   if (supplied.endsWith('@s.whatsapp.net')) return supplied;
   if (supplied.endsWith('@lid')) {
@@ -516,6 +518,33 @@ async function participantPhoneJid(client: any, participant: { id: string; jid?:
     }
   }
   return null;
+}
+
+async function updateParticipantsRaw(client: WASocket & Record<string, any>, jid: string, participants: string[], action: 'add' | 'remove') {
+  const query = client.query;
+  if (typeof query !== 'function') throw new Error('Baileys query API is unavailable.');
+  const response = await query.call(client, {
+    tag: 'iq',
+    attrs: { type: 'set', xmlns: 'w:g2', to: jid },
+    content: [{
+      tag: action,
+      attrs: {},
+      content: participants.map((participant) => ({ tag: 'participant', attrs: { jid: participant } })),
+    }],
+  });
+  const actionNode = Array.isArray(response?.content)
+    ? response.content.find((node: any) => node?.tag === action)
+    : null;
+  const affected = Array.isArray(actionNode?.content)
+    ? actionNode.content.filter((node: any) => node?.tag === 'participant')
+    : [];
+  if (!affected.length) {
+    const errorCode = String(actionNode?.attrs?.error || response?.attrs?.error || '');
+    throw new Error(errorCode
+      ? `WhatsApp rejected participant ${action} (code ${errorCode}).`
+      : `WhatsApp returned no participant confirmation for ${action}.`);
+  }
+  return affected.map((node: any) => ({ status: String(node?.attrs?.error || '200'), jid: String(node?.attrs?.jid || '') }));
 }
 
 app.get('/v1/communities/:communityId/participants', async (req, res) => {
@@ -554,7 +583,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
     }
-    const result = await client.communityParticipantsUpdate(req.params.communityId, [participant], action);
+    const result = await updateParticipantsRaw(client, req.params.communityId, [participant], action);
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'community_participant_update_not_confirmed', result });
     }
@@ -604,8 +633,8 @@ app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
-    const result = await client.groupParticipantsUpdate(req.params.groupId, [participant], 'remove');
-    if (result.some((item) => String(item.status) !== '200')) {
+    const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [participant], 'remove');
+    if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_removal_not_confirmed', result });
     }
     return res.json({ group_id: req.params.groupId, participant, result });
@@ -622,8 +651,8 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
-    const result = await client.groupParticipantsUpdate(req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
-    if (result.some((item) => String(item.status) !== '200')) {
+    const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
+    if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
     }
     return res.json({ group_id: req.params.groupId, phone, result });
