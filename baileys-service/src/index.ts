@@ -95,6 +95,15 @@ async function startSocket(forceFresh = false): Promise<void> {
     lastError = null;
     try {
       await fs.mkdir(AUTH_DIR, { recursive: true });
+      // Log paths and filenames only (never credential contents) to verify that
+      // Baileys is writing its session inside Railway's persistent volume.
+      const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
+      const authEntries = await fs.readdir(AUTH_DIR).catch(() => [] as string[]);
+      const volumeEntries = await fs.readdir(volumePath, { withFileTypes: true }).then(async entries => Promise.all(entries.map(async entry => ({
+        name: entry.name,
+        files: entry.isDirectory() ? await fs.readdir(`${volumePath}/${entry.name}`).catch(() => [] as string[]) : [],
+      })))).catch(() => [] as Array<{ name: string; files: string[] }>);
+      logger.info({ authDir: AUTH_DIR, volumePath, authEntries, volumeEntries }, 'WhatsApp persistent auth storage diagnostic');
       if (forceFresh) {
         await fs.rm(AUTH_DIR, { recursive: true, force: true });
         await fs.mkdir(AUTH_DIR, { recursive: true });
