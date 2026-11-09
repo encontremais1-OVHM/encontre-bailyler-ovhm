@@ -327,7 +327,6 @@ app.post('/v1/pairing-code', async (req, res) => {
     const pairingSocket = currentSocket();
     if (!pairingSocket) throw new Error('O serviço não conseguiu preparar a sessão de emparelhamento. Tente novamente.');
     await waitForPairingTransport(pairingSocket);
-    if (sock !== pairingSocket || state !== 'connecting') throw new Error('A ligação foi interrompida antes de gerar o código.');
     const code = await pairingSocket.requestPairingCode(phone);
     pairingCode = code;
     qrText = null;
