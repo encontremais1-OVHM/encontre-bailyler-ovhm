@@ -20,7 +20,7 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_TOKEN = process.env.API_TOKEN || '';
 const AUTH_DIR = process.env.AUTH_DIR || '/data/baileys-auth';
-const VOLUME_PATH = (process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data').replace(/\\/+$/, '') || '/data';
+const VOLUME_PATH = (process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data').replace(/\/+$/, '') || '/data';
 const PERSISTENT_AUTH_DIR = `${VOLUME_PATH}/baileys-auth`;
 let activeAuthDir = PERSISTENT_AUTH_DIR;
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
