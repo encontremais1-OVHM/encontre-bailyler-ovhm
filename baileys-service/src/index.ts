@@ -361,6 +361,25 @@ app.get('/v1/communities', async (_req, res) => {
   }
 });
 
+app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
+  const client = connectedSocket(res);
+  if (!client) return;
+  try {
+    const metadata = await client.communityMetadata(req.params.communityId);
+    if (!isConnectedAccountAdmin(metadata.participants, client)) {
+      return res.status(403).json({ error: 'bot_must_be_community_admin' });
+    }
+    const code = await client.communityInviteCode(req.params.communityId);
+    if (!code) return res.status(404).json({ error: 'community_invite_link_unavailable' });
+    return res.json({
+      community_id: req.params.communityId,
+      invite_link: `https://chat.whatsapp.com/${code}`,
+    });
+  } catch (error) {
+    return res.status(502).json({ error: 'community_invite_link_fetch_failed', message: safeError(error) });
+  }
+});
+
 app.get('/v1/communities/:communityId/participants', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
