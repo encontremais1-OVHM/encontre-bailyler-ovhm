@@ -264,6 +264,18 @@ function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string;
   ));
 }
 
+/**
+ * Baileys 6.7.24 may omit communities from communityFetchAllParticipating()
+ * and communityMetadata() can fail for a parent container. Its group parser
+ * exposes the same parent reliably through groupFetchAllParticipating().
+ */
+async function participatingCommunity(client: WASocket, communityId: string): Promise<any | null> {
+  const groups = await client.groupFetchAllParticipating() as Record<string, any>;
+  const community = groups[communityId];
+  if (!community?.isCommunity || community.isCommunityAnnounce) return null;
+  return community;
+}
+
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
 app.use('/v1', requireToken);
 
@@ -437,8 +449,9 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
   try {
-    const metadata = await client.communityMetadata(req.params.communityId);
-    if (!isConnectedAccountAdmin(metadata.participants, client)) {
+    const community = await participatingCommunity(client, req.params.communityId);
+    if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
+    if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
     }
     const code = await client.communityInviteCode(req.params.communityId);
@@ -448,6 +461,7 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
       invite_link: `https://chat.whatsapp.com/${code}`,
     });
   } catch (error) {
+    logger.error({ communityId: req.params.communityId, error: safeError(error) }, 'Could not fetch current WhatsApp Community invite');
     return res.status(502).json({ error: 'community_invite_link_fetch_failed', message: safeError(error) });
   }
 });
@@ -474,14 +488,16 @@ app.get('/v1/communities/:communityId/participants', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
   try {
-    const metadata = await client.communityMetadata(req.params.communityId);
-    const participants = await Promise.all((metadata.participants || []).map(async (participant: { id: string; jid?: string; admin?: string | null }) => ({
+    const community = await participatingCommunity(client, req.params.communityId);
+    if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
+    const participants = await Promise.all((community.participants || []).map(async (participant: { id: string; jid?: string; admin?: string | null }) => ({
       id: participant.id,
       jid: await participantPhoneJid(client, participant),
       admin: participant.admin || null,
     })));
     return res.json({ community_id: req.params.communityId, participants });
   } catch (error) {
+    logger.error({ communityId: req.params.communityId, error: safeError(error) }, 'Could not fetch WhatsApp Community participants');
     return res.status(502).json({ error: 'community_participants_fetch_failed', message: safeError(error) });
   }
 });
@@ -499,8 +515,9 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     return res.status(400).json({ error: 'invalid_participant_id' });
   }
   try {
-    const metadata = await client.communityMetadata(req.params.communityId);
-    if (!isConnectedAccountAdmin(metadata.participants, client)) {
+    const community = await participatingCommunity(client, req.params.communityId);
+    if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
+    if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
     }
     const result = await client.communityParticipantsUpdate(req.params.communityId, [participant], action);
