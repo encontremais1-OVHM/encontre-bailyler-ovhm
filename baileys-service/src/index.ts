@@ -452,19 +452,35 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
   }
 });
 
+async function participantPhoneJid(client: any, participant: { id: string; jid?: string | null }): Promise<string | null> {
+  const supplied = String(participant.jid || participant.id || '');
+  if (supplied.endsWith('@s.whatsapp.net')) return supplied;
+  if (supplied.endsWith('@lid')) {
+    try {
+      const mapping = client.signalRepository?.lidMapping;
+      const resolver = mapping?.getPNForLID;
+      if (typeof resolver === 'function') {
+        const resolved = await resolver.call(mapping, supplied);
+        if (typeof resolved === 'string' && resolved.endsWith('@s.whatsapp.net')) return resolved;
+      }
+    } catch (error) {
+      logger.debug({ error: safeError(error) }, 'Could not resolve WhatsApp LID to phone JID');
+    }
+  }
+  return null;
+}
+
 app.get('/v1/communities/:communityId/participants', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
   try {
     const metadata = await client.communityMetadata(req.params.communityId);
-    return res.json({
-      community_id: req.params.communityId,
-      participants: (metadata.participants || []).map((participant: { id: string; jid?: string; admin?: string | null }) => ({
-        id: participant.id,
-        jid: participant.jid || null,
-        admin: participant.admin || null,
-      })),
-    });
+    const participants = await Promise.all((metadata.participants || []).map(async (participant: { id: string; jid?: string; admin?: string | null }) => ({
+      id: participant.id,
+      jid: await participantPhoneJid(client, participant),
+      admin: participant.admin || null,
+    })));
+    return res.json({ community_id: req.params.communityId, participants });
   } catch (error) {
     return res.status(502).json({ error: 'community_participants_fetch_failed', message: safeError(error) });
   }
@@ -498,13 +514,14 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
 });
 
 app.get('/v1/groups/:groupId/participants', async (req, res) => {
-  const client = connectedSocket(res);
+  const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
   try {
     const metadata = await client.groupMetadata(req.params.groupId);
-    return res.json({ group_id: metadata.id, participants: metadata.participants.map(p => ({
-      id: p.id, jid: p.jid || null, admin: p.admin || null,
-    })) });
+    const participants = await Promise.all(metadata.participants.map(async (participant) => ({
+      id: participant.id, jid: await participantPhoneJid(client, participant), admin: participant.admin || null,
+    })));
+    return res.json({ group_id: metadata.id, participants });
   } catch (error) {
     return res.status(502).json({ error: 'participants_fetch_failed', message: safeError(error) });
   }
