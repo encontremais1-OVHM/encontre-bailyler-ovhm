@@ -150,8 +150,13 @@ async function startSocket(forceFresh = false): Promise<void> {
           } else if (reconnectAllowed) {
             if (reconnectTimer) clearTimeout(reconnectTimer);
             reconnectAttempts += 1;
-            const delayMs = Math.min(5 * 60 * 1000, 5000 * (2 ** Math.min(reconnectAttempts - 1, 6)));
-            logger.warn({ reconnectAttempts, reconnectInMs: delayMs, statusCode }, 'Scheduling WhatsApp reconnection');
+            // 515 is Baileys' explicit "restart required" response after a
+            // successful pairing handshake. Recreate the socket immediately
+            // with the credentials already persisted by creds.update.
+            const delayMs = statusCode === 515
+              ? 1000
+              : Math.min(5 * 60 * 1000, 5000 * (2 ** Math.min(reconnectAttempts - 1, 6)));
+            logger.warn({ reconnectAttempts, reconnectInMs: delayMs, statusCode, restartRequired: statusCode === 515 }, 'Scheduling WhatsApp reconnection');
             reconnectTimer = setTimeout(() => void startSocket(), delayMs);
           }
         }
