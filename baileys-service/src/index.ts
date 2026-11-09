@@ -652,7 +652,7 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
     const metadata = await client.groupMetadata(req.params.groupId);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
     const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
-    if (result.some((item) => String(item.status) !== '200')) {
+    if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
     }
     return res.json({ group_id: req.params.groupId, phone, result });
