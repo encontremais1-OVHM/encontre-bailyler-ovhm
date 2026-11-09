@@ -117,7 +117,16 @@ async function startSocket(forceFresh = false): Promise<void> {
         return;
       }
       sock = nextSocket;
-      nextSocket.ev.on('creds.update', saveCreds);
+      // EventEmitter does not await async listeners. Serialize credential writes
+      // and wait for them before handling a restart-required (515) close.
+      let credentialSaveQueue = Promise.resolve();
+      nextSocket.ev.on('creds.update', () => {
+        credentialSaveQueue = credentialSaveQueue
+          .then(() => saveCreds())
+          .catch((error) => {
+            logger.error({ error: safeError(error) }, 'Could not persist WhatsApp credentials');
+          });
+      });
       nextSocket.ev.on('connection.update', async (update) => {
         if (update.qr) {
           qrText = update.qr;
@@ -144,6 +153,11 @@ async function startSocket(forceFresh = false): Promise<void> {
           const loggedOut = statusCode === DisconnectReason.loggedOut;
           // Ignore close events from sockets that were intentionally replaced.
           if (sock !== nextSocket || generation !== socketGeneration) return;
+          // Baileys emits creds.update separately from connection.update. The
+          // 515 handshake can close immediately after pair-success, so make
+          // sure the new me/keys have reached the mounted volume before restart.
+          await credentialSaveQueue;
+          if (sock !== nextSocket || generation !== socketGeneration) return;
           sock = null;
           state = loggedOut ? 'logged_out' : 'disconnected';
           qrText = null;
@@ -169,7 +183,7 @@ async function startSocket(forceFresh = false): Promise<void> {
             // successful pairing handshake. Recreate the socket immediately
             // with the credentials already persisted by creds.update.
             const delayMs = statusCode === 515
-              ? 1000
+              ? 100
               : Math.min(30_000, 3000 * (2 ** Math.min(reconnectAttempts - 1, 4)));
             logger.warn({ reconnectAttempts, reconnectInMs: delayMs, statusCode, restartRequired: statusCode === 515 }, 'Scheduling WhatsApp reconnection');
             reconnectTimer = setTimeout(() => {
