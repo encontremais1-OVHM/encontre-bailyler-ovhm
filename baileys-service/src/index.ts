@@ -49,6 +49,9 @@ let reconnectTimer: NodeJS.Timeout | null = null;
 let startPromise: Promise<void> | null = null;
 let reconnectAllowed = true;
 let reconnectAttempts = 0;
+let socketGeneration = 0;
+let pairingInProgress = false;
+let qrExpiresAt: number | null = null;
 
 function requireToken(req: Request, res: Response, next: NextFunction) {
   const header = req.header('authorization') || '';
@@ -81,6 +84,11 @@ async function emitWebhook(event: string, details: Record<string, unknown> = {})
 async function startSocket(forceFresh = false): Promise<void> {
   if (startPromise) return startPromise;
   if (sock && (state === 'connecting' || state === 'connected')) return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const generation = ++socketGeneration;
 
   const operation = (async () => {
     state = 'connecting';
@@ -104,11 +112,25 @@ async function startSocket(forceFresh = false): Promise<void> {
         connectTimeoutMs: 60_000,
         defaultQueryTimeoutMs: 60_000,
       });
+      if (generation !== socketGeneration) {
+        try { nextSocket.end(undefined); } catch { /* superseded during socket creation */ }
+        return;
+      }
       sock = nextSocket;
-      nextSocket.ev.on('creds.update', saveCreds);
+      // EventEmitter does not await async listeners. Serialize credential writes
+      // and wait for them before handling a restart-required (515) close.
+      let credentialSaveQueue = Promise.resolve();
+      nextSocket.ev.on('creds.update', () => {
+        credentialSaveQueue = credentialSaveQueue
+          .then(() => saveCreds())
+          .catch((error) => {
+            logger.error({ error: safeError(error) }, 'Could not persist WhatsApp credentials');
+          });
+      });
       nextSocket.ev.on('connection.update', async (update) => {
         if (update.qr) {
           qrText = update.qr;
+          qrExpiresAt = Date.now() + 45_000;
           qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 2, width: 320 });
           pairingCode = null;
           state = 'connecting';
@@ -118,6 +140,7 @@ async function startSocket(forceFresh = false): Promise<void> {
           state = 'connected';
           qrText = null;
           qrDataUrl = null;
+          qrExpiresAt = null;
           pairingCode = null;
           lastError = null;
           reconnectAttempts = 0;
@@ -129,11 +152,17 @@ async function startSocket(forceFresh = false): Promise<void> {
           const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
           const loggedOut = statusCode === DisconnectReason.loggedOut;
           // Ignore close events from sockets that were intentionally replaced.
-          if (sock !== nextSocket) return;
+          if (sock !== nextSocket || generation !== socketGeneration) return;
+          // Baileys emits creds.update separately from connection.update. The
+          // 515 handshake can close immediately after pair-success, so make
+          // sure the new me/keys have reached the mounted volume before restart.
+          await credentialSaveQueue;
+          if (sock !== nextSocket || generation !== socketGeneration) return;
           sock = null;
           state = loggedOut ? 'logged_out' : 'disconnected';
           qrText = null;
           qrDataUrl = null;
+          qrExpiresAt = null;
           pairingCode = null;
           lastError = statusCode === 403
             ? 'WhatsApp recusou a sessão (403); pode ser necessário voltar a vincular o dispositivo.'
@@ -154,10 +183,13 @@ async function startSocket(forceFresh = false): Promise<void> {
             // successful pairing handshake. Recreate the socket immediately
             // with the credentials already persisted by creds.update.
             const delayMs = statusCode === 515
-              ? 1000
-              : Math.min(5 * 60 * 1000, 5000 * (2 ** Math.min(reconnectAttempts - 1, 6)));
+              ? 100
+              : Math.min(30_000, 3000 * (2 ** Math.min(reconnectAttempts - 1, 4)));
             logger.warn({ reconnectAttempts, reconnectInMs: delayMs, statusCode, restartRequired: statusCode === 515 }, 'Scheduling WhatsApp reconnection');
-            reconnectTimer = setTimeout(() => void startSocket(), delayMs);
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              void startSocket();
+            }, delayMs);
           }
         }
       });
@@ -177,7 +209,7 @@ async function startSocket(forceFresh = false): Promise<void> {
   }
 }
 
-function waitForPairingTransport(client: WASocket, timeoutMs = 20_000): Promise<void> {
+function waitForPairingTransport(client: WASocket, timeoutMs = 45_000): Promise<void> {
   if (qrText || state === 'connected') return Promise.resolve();
   return new Promise((resolve, reject) => {
     const finish = (error?: Error) => {
@@ -229,12 +261,15 @@ app.get('/v1/status', (_req, res) => res.json({
   connected: state === 'connected',
   has_qr: Boolean(qrDataUrl),
   has_pairing_code: Boolean(pairingCode),
+  pairing_in_progress: pairingInProgress,
+  qr_expires_at: qrExpiresAt ? new Date(qrExpiresAt).toISOString() : null,
   last_error: lastError,
   phone: sock?.user?.id?.split(':')[0] || null,
 }));
 
 app.post('/v1/connect', async (_req, res) => {
   try {
+    if (pairingInProgress) return res.status(409).json({ error: 'pairing_in_progress', message: 'A vinculação por código já está em andamento.' });
     if (state === 'connected') return res.json({ state, message: 'Already connected' });
     if (state === 'connecting' && sock) return res.status(202).json({ state: 'connecting', message: 'Connection already in progress; poll /v1/qr or /v1/status' });
     reconnectAllowed = true;
@@ -253,38 +288,59 @@ app.get('/v1/qr', (_req, res) => {
 app.post('/v1/pairing-code', async (req, res) => {
   const phone = String(req.body?.phone || '').replace(/\D/g, '');
   if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'phone_must_include_country_code_digits_only' });
-  try {
-    if (state === 'connected') {
-      return res.status(409).json({ error: 'whatsapp_already_connected', message: 'Desconecte a conta atual antes de vincular outro número.' });
-    }
+  if (pairingInProgress) return res.status(409).json({ error: 'pairing_in_progress', message: 'Já existe uma tentativa de vinculação em andamento. Aguarde ou cancele-a.' });
+  if (state === 'connected') {
+    return res.status(409).json({ error: 'whatsapp_already_connected', message: 'Use “Ligar outro número” para terminar a sessão actual antes de vincular outro número.' });
+  }
+  if (state === 'connecting' && sock) {
+    return res.status(409).json({ error: 'connection_already_in_progress', message: 'Já existe uma ligação em andamento. Cancele-a antes de mudar o método de ligação.' });
+  }
 
-    // Pairing a different number must never reuse credentials from the previous account.
-    reconnectAllowed = false;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    const previousSocket = sock;
-    sock = null;
+  pairingInProgress = true;
+  reconnectAllowed = false;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const previousSocket = sock;
+  sock = null;
+  ++socketGeneration; // invalidate every event handler attached to the previous socket
+  try {
     if (previousSocket) {
       try { previousSocket.end(undefined); } catch { /* socket may already be closed */ }
     }
+    // Wait for any in-flight socket construction to finish before deleting or
+    // replacing credentials. This prevents QR and pairing-code requests racing.
+    const pendingStart = startPromise;
+    if (pendingStart) await pendingStart.catch(() => undefined);
+    await fs.rm(AUTH_DIR, { recursive: true, force: true });
+    await fs.mkdir(AUTH_DIR, { recursive: true });
+    state = 'disconnected';
     qrText = null;
     qrDataUrl = null;
+    qrExpiresAt = null;
     pairingCode = null;
-    await fs.rm(AUTH_DIR, { recursive: true, force: true });
-    await startSocket(true);
+    lastError = null;
 
-    const pairingSocket = currentSocket();
-    if (!pairingSocket) return res.status(503).json({ error: 'socket_not_ready' });
     reconnectAllowed = true;
+    await startSocket(true);
+    const pairingSocket = currentSocket();
+    if (!pairingSocket) throw new Error('O serviço não conseguiu preparar a sessão de emparelhamento. Tente novamente.');
     await waitForPairingTransport(pairingSocket);
     const code = await pairingSocket.requestPairingCode(phone);
     pairingCode = code;
     qrText = null;
     qrDataUrl = null;
+    qrExpiresAt = null;
     return res.json({ pairing_code: code, state: 'connecting', instructions: 'Enter this code in WhatsApp > Linked devices > Link with phone number' });
   } catch (error) {
+    reconnectAllowed = false;
+    state = 'error';
     lastError = safeError(error);
     logger.error({ error: lastError }, 'Could not generate WhatsApp pairing code');
     return res.status(500).json({ error: 'pairing_code_failed', message: lastError });
+  } finally {
+    pairingInProgress = false;
   }
 });
 
@@ -513,8 +569,11 @@ app.post('/v1/messages/send', async (req, res) => {
 });
 
 app.post('/v1/disconnect', async (_req, res) => {
+  if (pairingInProgress) return res.status(409).json({ error: 'pairing_in_progress', message: 'Aguarde a tentativa de vinculação terminar antes de desconectar.' });
   reconnectAllowed = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  ++socketGeneration;
   const currentSocket = sock;
   sock = null;
   try { await currentSocket?.logout(); } catch {
@@ -524,6 +583,7 @@ app.post('/v1/disconnect', async (_req, res) => {
   state = 'logged_out';
   qrText = null;
   qrDataUrl = null;
+  qrExpiresAt = null;
   pairingCode = null;
   lastError = null;
   await emitWebhook('whatsapp.manual_disconnect');
@@ -531,12 +591,15 @@ app.post('/v1/disconnect', async (_req, res) => {
 });
 
 app.post('/v1/logout', async (_req, res) => {
+  if (pairingInProgress) return res.status(409).json({ error: 'pairing_in_progress', message: 'Aguarde a tentativa de vinculação terminar antes de terminar a sessão.' });
   reconnectAllowed = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  ++socketGeneration;
   try { await sock?.logout(); } catch { /* continue clearing local credentials */ }
   sock = null;
   state = 'logged_out';
-  qrText = null; qrDataUrl = null; pairingCode = null;
+  qrText = null; qrDataUrl = null; qrExpiresAt = null; pairingCode = null;
   await fs.rm(AUTH_DIR, { recursive: true, force: true });
   return res.json({ state, message: 'Session logged out and local auth data removed' });
 });
