@@ -20,6 +20,9 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_TOKEN = process.env.API_TOKEN || '';
 const AUTH_DIR = process.env.AUTH_DIR || '/data/baileys-auth';
+const VOLUME_PATH = (process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data').replace(/\\/+$/, '') || '/data';
+const PERSISTENT_AUTH_DIR = `${VOLUME_PATH}/baileys-auth`;
+let activeAuthDir = PERSISTENT_AUTH_DIR;
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
 
 if (API_TOKEN.length < 32) {
@@ -68,6 +71,37 @@ function safeError(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 300) : 'Unknown error';
 }
 
+async function hasRegisteredAuth(directory: string): Promise<boolean> {
+  try {
+    const raw = await fs.readFile(`${directory}/creds.json`, 'utf8');
+    return JSON.parse(raw)?.registered === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Recover an existing registered session from the persistent volume even if
+ * AUTH_DIR was previously configured to a different directory. New sessions
+ * always use the Railway volume at /data/baileys-auth.
+ */
+async function resolveAuthDirectory(): Promise<string> {
+  const candidates = [AUTH_DIR, PERSISTENT_AUTH_DIR, VOLUME_PATH];
+  const entries = await fs.readdir(VOLUME_PATH, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (entry.isDirectory()) candidates.push(`${VOLUME_PATH}/${entry.name}`);
+  }
+  for (const candidate of [...new Set(candidates)]) {
+    if (!await hasRegisteredAuth(candidate)) continue;
+    const isPersistent = candidate === VOLUME_PATH || candidate.startsWith(`${VOLUME_PATH}/`);
+    if (isPersistent) return candidate;
+    await fs.mkdir(PERSISTENT_AUTH_DIR, { recursive: true });
+    await fs.cp(candidate, PERSISTENT_AUTH_DIR, { recursive: true, force: true });
+    return PERSISTENT_AUTH_DIR;
+  }
+  return PERSISTENT_AUTH_DIR;
+}
+
 async function emitWebhook(event: string, details: Record<string, unknown> = {}) {
   const url = process.env.WEBHOOK_URL;
   if (!url) return;
@@ -94,21 +128,12 @@ async function startSocket(forceFresh = false): Promise<void> {
     state = 'connecting';
     lastError = null;
     try {
-      await fs.mkdir(AUTH_DIR, { recursive: true });
-      // Log paths and filenames only (never credential contents) to verify that
-      // Baileys is writing its session inside Railway's persistent volume.
-      const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
-      const authEntries = await fs.readdir(AUTH_DIR).catch(() => [] as string[]);
-      const volumeEntries = await fs.readdir(volumePath, { withFileTypes: true }).then(async entries => Promise.all(entries.map(async entry => ({
-        name: entry.name,
-        files: entry.isDirectory() ? await fs.readdir(`${volumePath}/${entry.name}`).catch(() => [] as string[]) : [],
-      })))).catch(() => [] as Array<{ name: string; files: string[] }>);
-      logger.info({ authDir: AUTH_DIR, volumePath, authEntries, volumeEntries }, 'WhatsApp persistent auth storage diagnostic');
+      await fs.mkdir(activeAuthDir, { recursive: true });
       if (forceFresh) {
-        await fs.rm(AUTH_DIR, { recursive: true, force: true });
-        await fs.mkdir(AUTH_DIR, { recursive: true });
+        await fs.rm(activeAuthDir, { recursive: true, force: true });
+        await fs.mkdir(activeAuthDir, { recursive: true });
       }
-      const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      const { state: authState, saveCreds } = await useMultiFileAuthState(activeAuthDir);
       const hasRegisteredSession = Boolean(authState.creds.registered);
       const { version } = await fetchLatestBaileysVersion();
       const nextSocket = makeWASocket({
@@ -183,7 +208,7 @@ async function startSocket(forceFresh = false): Promise<void> {
           await emitWebhook('whatsapp.disconnected', { logged_out: loggedOut, status_code: statusCode });
           if (loggedOut) {
             // A logged-out session cannot be reused to link another number.
-            await fs.rm(AUTH_DIR, { recursive: true, force: true }).catch((error) => {
+            await fs.rm(activeAuthDir, { recursive: true, force: true }).catch((error) => {
               logger.warn({ error: safeError(error) }, 'Could not clear logged-out WhatsApp credentials');
             });
           } else if (statusCode === 408 && !hasRegisteredSession) {
@@ -345,8 +370,8 @@ app.post('/v1/pairing-code', async (req, res) => {
     // replacing credentials. This prevents QR and pairing-code requests racing.
     const pendingStart = startPromise;
     if (pendingStart) await pendingStart.catch(() => undefined);
-    await fs.rm(AUTH_DIR, { recursive: true, force: true });
-    await fs.mkdir(AUTH_DIR, { recursive: true });
+    await fs.rm(activeAuthDir, { recursive: true, force: true });
+    await fs.mkdir(activeAuthDir, { recursive: true });
     state = 'disconnected';
     qrText = null;
     qrDataUrl = null;
@@ -633,7 +658,7 @@ app.post('/v1/disconnect', async (_req, res) => {
   try { await currentSocket?.logout(); } catch {
     try { currentSocket?.end(undefined); } catch { /* socket may already be closed */ }
   }
-  await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  await fs.rm(activeAuthDir, { recursive: true, force: true });
   state = 'logged_out';
   qrText = null;
   qrDataUrl = null;
@@ -654,7 +679,7 @@ app.post('/v1/logout', async (_req, res) => {
   sock = null;
   state = 'logged_out';
   qrText = null; qrDataUrl = null; qrExpiresAt = null; pairingCode = null;
-  await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  await fs.rm(activeAuthDir, { recursive: true, force: true });
   return res.json({ state, message: 'Session logged out and local auth data removed' });
 });
 
@@ -665,8 +690,16 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, HOST, () => {
   logger.info({ host: HOST, port: PORT }, 'Encontre + Baileys service listening');
-  void fs.mkdir(AUTH_DIR, { recursive: true }).then(async () => {
-    const { state: authState } = await useMultiFileAuthState(AUTH_DIR);
+  void resolveAuthDirectory().then(async (resolvedDirectory) => {
+    activeAuthDir = resolvedDirectory;
+    await fs.mkdir(activeAuthDir, { recursive: true });
+    const authEntries = await fs.readdir(activeAuthDir).catch(() => [] as string[]);
+    const volumeEntries = await fs.readdir(VOLUME_PATH, { withFileTypes: true }).then(async entries => Promise.all(entries.map(async entry => ({
+      name: entry.name,
+      files: entry.isDirectory() ? await fs.readdir(`${VOLUME_PATH}/${entry.name}`).catch(() => [] as string[]) : [],
+    })))).catch(() => [] as Array<{ name: string; files: string[] }>);
+    logger.info({ authDir: activeAuthDir, volumePath: VOLUME_PATH, authEntries, volumeEntries }, 'WhatsApp persistent auth storage diagnostic');
+    const { state: authState } = await useMultiFileAuthState(activeAuthDir);
     if (authState.creds.registered) {
       logger.info('Persisted WhatsApp session found; restoring connection');
       await startSocket();
