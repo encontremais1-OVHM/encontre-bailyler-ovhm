@@ -497,7 +497,7 @@ app.post('/v1/messages/send', async (req, res) => {
   if (!client) return;
   const phone = String(req.body?.phone || '').replace(/\D/g, '');
   const message = String(req.body?.message || '').trim();
-  if (!/^\\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'invalid_phone' });
+  if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'invalid_phone' });
   if (!message || message.length > 3500) return res.status(400).json({ error: 'invalid_message' });
   try {
     const result = await client.sendMessage(phone + '@s.whatsapp.net', { text: message });
