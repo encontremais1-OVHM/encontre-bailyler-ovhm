@@ -495,7 +495,7 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
 app.post('/v1/messages/send', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
-  const phone = String(req.body?.phone || '').replace(/\\D/g, '');
+  const phone = String(req.body?.phone || '').replace(/\D/g, '');
   const message = String(req.body?.message || '').trim();
   if (!/^\\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'invalid_phone' });
   if (!message || message.length > 3500) return res.status(400).json({ error: 'invalid_message' });
