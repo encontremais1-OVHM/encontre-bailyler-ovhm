@@ -508,7 +508,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
       let addFailure: unknown = null;
       step = 'whatsapp_participant_add';
       try {
-        const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add');
+        const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add', groupType === 'community');
         if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
           addFailure = new Error('WhatsApp did not confirm the participant add operation');
         } else {
@@ -771,11 +771,21 @@ async function participantPhoneJid(client: any, participant: { id: string; jid?:
   return null;
 }
 
-async function updateParticipantsRaw(client: WASocket & Record<string, any>, jid: string, participants: string[], action: 'add' | 'remove') {
-  const update = client.groupParticipantsUpdate;
-  if (typeof update !== 'function') throw new Error('Baileys groupParticipantsUpdate API is unavailable.');
+async function updateParticipantsRaw(
+  client: WASocket & Record<string, any>,
+  jid: string,
+  participants: string[],
+  action: 'add' | 'remove',
+  isCommunity = false
+) {
+  // A Community is not a regular group JID. Baileys 6.7.24 exposes a
+  // dedicated communityParticipantsUpdate() query; using groupParticipantsUpdate()
+  // against the parent Community returns WhatsApp "bad-request".
+  const update = isCommunity ? client.communityParticipantsUpdate : client.groupParticipantsUpdate;
+  const method = isCommunity ? 'communityParticipantsUpdate' : 'groupParticipantsUpdate';
+  if (typeof update !== 'function') throw new Error('Baileys ' + method + ' API is unavailable.');
   const result = await update.call(client, jid, participants, action);
-  logger.info({ jid, action, participant_count: participants.length, result }, 'WhatsApp participant update response');
+  logger.info({ jid, action, is_community: isCommunity, participant_count: participants.length, result }, 'WhatsApp participant update response');
   if (!Array.isArray(result) || result.length === 0) {
     throw new Error('WhatsApp returned no participant confirmation for ' + action + '.');
   }
