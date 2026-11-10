@@ -165,15 +165,43 @@ async function resolveAuthDirectory(): Promise<string> {
 
 async function emitWebhook(event: string, details: Record<string, unknown> = {}) {
   const url = process.env.WEBHOOK_URL;
-  if (!url) return;
-  try {
-    const body = JSON.stringify({ event, event_id: randomUUID(), occurred_at: new Date().toISOString(), ...details });
-    const secret = process.env.WEBHOOK_SECRET || '';
-    const signature = createHmac('sha256', secret).update(body).digest('hex');
-    await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-encontre-signature': signature }, body, signal: AbortSignal.timeout(8000) });
-  } catch (error) {
-    logger.warn({ error: safeError(error) }, 'Webhook delivery failed');
+  const secret = process.env.WEBHOOK_SECRET || '';
+  if (!url || secret.length < 32) {
+    logger.warn({ event, configuredUrl: Boolean(url), configuredSecret: secret.length >= 32 }, 'WhatsApp webhook is not configured; event was not delivered');
+    return false;
   }
+
+  // Reuse the same signed body and event ID for every attempt. The receiver
+  // can therefore safely deduplicate retries without losing an event.
+  const body = JSON.stringify({ event, event_id: randomUUID(), occurred_at: new Date().toISOString(), ...details });
+  const signature = createHmac('sha256', secret).update(body).digest('hex');
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-encontre-signature': signature },
+        body,
+        signal: AbortSignal.timeout(8000),
+      });
+      const responseText = (await response.text()).slice(0, 300);
+      if (response.ok) {
+        logger.info({ event, status: response.status, attempt }, 'WhatsApp webhook delivered');
+        return true;
+      }
+
+      const retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+      logger.warn({ event, status: response.status, attempt, retryable, response: responseText }, 'WhatsApp webhook returned a non-success response');
+      if (!retryable || attempt === maxAttempts) return false;
+    } catch (error) {
+      logger.warn({ event, attempt, error: safeError(error) }, 'WhatsApp webhook delivery attempt failed');
+      if (attempt === maxAttempts) return false;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, attempt * 750));
+  }
+  return false;
 }
 
 async function startSocket(forceFresh = false): Promise<void> {
