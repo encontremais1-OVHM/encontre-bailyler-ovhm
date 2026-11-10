@@ -124,10 +124,18 @@ function safeError(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 300) : 'Unknown error';
 }
 
+function hasLinkedWhatsAppIdentity(creds: any): boolean {
+  // Some Baileys auth snapshots contain a valid linked-device identity even
+  // when the legacy "registered" boolean was not flushed to creds.json.
+  // The authenticated WhatsApp identity is the durable signal that this is
+  // an existing session, not a fresh QR pairing.
+  return Boolean(creds?.registered === true || creds?.me?.id || creds?.me?.jid);
+}
+
 async function hasRegisteredAuth(directory: string): Promise<boolean> {
   try {
     const raw = await fs.readFile(`${directory}/creds.json`, 'utf8');
-    return JSON.parse(raw)?.registered === true;
+    return hasLinkedWhatsAppIdentity(JSON.parse(raw));
   } catch {
     return false;
   }
@@ -187,7 +195,7 @@ async function startSocket(forceFresh = false): Promise<void> {
         await fs.mkdir(activeAuthDir, { recursive: true });
       }
       const { state: authState, saveCreds } = await useMultiFileAuthState(activeAuthDir);
-      const hasRegisteredSession = Boolean(authState.creds.registered);
+      const hasRegisteredSession = hasLinkedWhatsAppIdentity(authState.creds);
       const { version } = await fetchLatestBaileysVersion();
       const nextSocket = makeWASocket({
         version,
@@ -244,7 +252,7 @@ async function startSocket(forceFresh = false): Promise<void> {
           try {
             await saveCreds();
             await credentialSaveQueue;
-            logger.info({ registered: Boolean(authState.creds.registered), auth_directory: activeAuthDir }, 'WhatsApp credentials persisted after connection');
+            logger.info({ registered: Boolean(authState.creds.registered), has_linked_identity: hasLinkedWhatsAppIdentity(authState.creds), auth_directory: activeAuthDir }, 'WhatsApp credentials persisted after connection');
           } catch (error) {
             logger.error({ error: safeError(error) }, 'Could not persist credentials after WhatsApp connection');
           }
@@ -810,8 +818,8 @@ const server = app.listen(PORT, HOST, () => {
     })))).catch(() => [] as Array<{ name: string; files: string[] }>);
     logger.info({ authDir: activeAuthDir, volumePath: VOLUME_PATH, authEntries, volumeEntries }, 'WhatsApp persistent auth storage diagnostic');
     const { state: authState } = await useMultiFileAuthState(activeAuthDir);
-    if (authState.creds.registered) {
-      logger.info({ registered: true, auth_directory: activeAuthDir }, 'Persisted WhatsApp session found; restoring connection');
+    if (hasLinkedWhatsAppIdentity(authState.creds)) {
+      logger.info({ registered: Boolean(authState.creds.registered), has_linked_identity: true, auth_directory: activeAuthDir }, 'Persisted WhatsApp session found; restoring connection');
       reconnectAllowed = true;
       await startSocket();
     } else {
