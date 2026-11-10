@@ -641,7 +641,7 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
   if (!client) return;
   try {
     const metadata = await getGroupMetadata(client, req.params.groupId);
-    const participants = await Promise.all(metadata.participants.map(async (participant) => ({
+    const participants = await Promise.all(metadata.participants.map(async (participant: { id: string; jid?: string; phoneNumber?: string; admin?: string | null }) => ({
       id: participant.id,
       jid: await participantPhoneJid(client, participant),
       phoneNumber: participant.phoneNumber || null,
