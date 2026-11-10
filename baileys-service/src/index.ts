@@ -54,7 +54,10 @@ let reconnectAllowed = true;
 let reconnectAttempts = 0;
 let socketGeneration = 0;
 let pairingInProgress = false;
-const WHATSAPP_METADATA_CACHE_MS = 15_000;
+const WHATSAPP_METADATA_CACHE_MS = 60_000;
+const COMMUNITY_DISCOVERY_CACHE_MS = 120_000;
+let communityDiscoveryCache: { expiresAt: number; value: { communities: any[] } } | null = null;
+let communityDiscoveryFetch: Promise<{ communities: any[] }> | null = null;
 let participatingGroupsCache: { expiresAt: number; value: Record<string, any> } | null = null;
 let participatingGroupsFetch: Promise<Record<string, any>> | null = null;
 const groupMetadataCache = new Map<string, { expiresAt: number; value: any }>();
@@ -83,6 +86,7 @@ async function getGroupMetadata(client: WASocket, groupId: string, forceRefresh 
 
 function invalidateGroupMetadata(groupId?: string) {
   participatingGroupsCache = null;
+  communityDiscoveryCache = null;
   if (groupId) groupMetadataCache.delete(groupId);
   else groupMetadataCache.clear();
 }
@@ -460,63 +464,56 @@ app.get('/v1/groups', async (_req, res) => {
 app.get('/v1/communities', async (_req, res) => {
   const client = connectedSocket(res) as any;
   if (!client) return;
-  try {
-    // The group parser exposes parent Community containers as isCommunity.
-    // Avoid a second full-participation query: WhatsApp rate-limits this endpoint.
+  if (communityDiscoveryCache && communityDiscoveryCache.expiresAt > Date.now()) {
+    return res.json(communityDiscoveryCache.value);
+  }
+  if (communityDiscoveryFetch) {
+    try { return res.json(await communityDiscoveryFetch); }
+    catch (error) { return res.status(502).json({ error: 'communities_fetch_failed', message: safeError(error) }); }
+  }
+  const request = (async () => {
+    // Discover the parent containers from the one cached participating-groups
+    // snapshot. Do not fan out profile-picture and invite-code queries here:
+    // this endpoint only populates a selector and those optional requests
+    // trigger WhatsApp rate limits when the page is refreshed repeatedly.
     const groups = await getParticipatingGroups(client);
-    const communityEntries: any[] = [];
     const groupEntries = Object.values(groups) as any[];
-
-    // Baileys 6.7.24 can return an empty "communities" collection because
-    // its community parser expects <communities>/<community>, while WhatsApp
-    // may return the parent container as a normal <group>. The group parser
-    // exposes that container reliably through isCommunity.
-    const discoveredCommunities = new Map<string, any>();
-    for (const community of communityEntries) {
-      if (community?.id) discoveredCommunities.set(community.id, community);
-    }
+    const discovered = new Map<string, any>();
     for (const group of groupEntries) {
-      if (group?.id && group.isCommunity && !group.isCommunityAnnounce) {
-        discoveredCommunities.set(group.id, group);
-      }
+      if (group?.id && group.isCommunity && !group.isCommunityAnnounce) discovered.set(group.id, group);
     }
-    const allCommunities = [...discoveredCommunities.values()];
-    logger.info({
-      community_api_results: communityEntries.length,
-      group_api_results: groupEntries.length,
-      detected_communities: allCommunities.length,
-    }, 'WhatsApp communities discovered');
-
-    const result = await Promise.all(allCommunities.map(async (community: any) => {
-      const linkedGroups = groupEntries.filter((group: any) =>
-        group.linkedParent === community.id && !group.isCommunityAnnounce
-      );
-      const [imageUrl, inviteCode, subgroups] = await Promise.all([
-        client.profilePictureUrl(community.id, 'image').catch(() => null),
-        client.communityInviteCode(community.id).catch(() => null),
-        Promise.all(linkedGroups.map(async group => ({
+    const communities = [...discovered.values()].map((community: any) => ({
+      id: community.id,
+      subject: community.subject || 'Comunidade WhatsApp',
+      description: community.desc || null,
+      size: community.size || community.participants?.length || 0,
+      profile_picture_url: null,
+      invite_link: null,
+      subgroups: groupEntries
+        .filter((group: any) => group.linkedParent === community.id && !group.isCommunityAnnounce)
+        .map((group: any) => ({
           id: group.id,
-          subject: group.subject,
+          subject: group.subject || 'Grupo WhatsApp',
           description: group.desc || null,
           size: group.size || group.participants?.length || 0,
           linked_parent_id: group.linkedParent || community.id,
           is_community_announcement: Boolean(group.isCommunityAnnounce),
-          profile_picture_url: await client.profilePictureUrl(group.id, 'image').catch(() => null),
-        }))),
-      ]);
-      return {
-        id: community.id,
-        subject: community.subject,
-        description: community.desc || null,
-        size: community.size || community.participants?.length || 0,
-        profile_picture_url: imageUrl,
-        invite_link: inviteCode ? `https://chat.whatsapp.com/${inviteCode}` : null,
-        subgroups,
-      };
+          profile_picture_url: null,
+        })),
     }));
-    return res.json({ communities: result });
+    const value = { communities };
+    communityDiscoveryCache = { expiresAt: Date.now() + COMMUNITY_DISCOVERY_CACHE_MS, value };
+    logger.info({ detected_communities: communities.length, cached_for_ms: COMMUNITY_DISCOVERY_CACHE_MS }, 'WhatsApp communities discovered');
+    return value;
+  })();
+  communityDiscoveryFetch = request;
+  try {
+    return res.json(await request);
   } catch (error) {
+    logger.warn({ error: safeError(error) }, 'Could not discover WhatsApp communities');
     return res.status(502).json({ error: 'communities_fetch_failed', message: safeError(error) });
+  } finally {
+    if (communityDiscoveryFetch === request) communityDiscoveryFetch = null;
   }
 });
 
