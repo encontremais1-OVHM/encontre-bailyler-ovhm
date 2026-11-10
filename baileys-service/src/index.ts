@@ -19,6 +19,7 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_TOKEN = process.env.API_TOKEN || '';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const AUTH_DIR = process.env.AUTH_DIR || '/data/baileys-auth';
 const VOLUME_PATH = (process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data').replace(/\/+$/, '') || '/data';
 const PERSISTENT_AUTH_DIR = `${VOLUME_PATH}/baileys-auth`;
@@ -31,14 +32,19 @@ if (API_TOKEN.length < 32) {
 }
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({
+  limit: '32kb',
+  verify(req, _res, buf) {
+    (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+  },
+}));
 app.use(cors({
   origin(origin, callback) {
     if (!origin || CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes(origin)) return callback(null, true);
     return callback(new Error('Origin not allowed'));
   },
   methods: ['GET', 'POST'],
-  allowedHeaders: ['Authorization', 'Content-Type'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'x-encontre-signature'],
 }));
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'logged_out' | 'error';
@@ -115,6 +121,20 @@ function requireToken(req: Request, res: Response, next: NextFunction) {
   const a = Buffer.from(supplied);
   const b = Buffer.from(API_TOKEN);
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
+function requireWebhookSignature(req: Request, res: Response, next: NextFunction) {
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+  const supplied = String(req.header('x-encontre-signature') || '').toLowerCase();
+  if (WEBHOOK_SECRET.length < 32 || !rawBody || !/^[a-f0-9]{64}$/.test(supplied)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const expected = createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest();
+  const provided = Buffer.from(supplied, 'hex');
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   next();
@@ -439,6 +459,82 @@ async function participatingCommunity(client: WASocket, communityId: string, for
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
+
+// Private server-to-server add path. It uses the shared webhook HMAC secret so
+// Postgres can request additions without exposing the general API_TOKEN.
+app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (req, res) => {
+  const groupId = String(req.body?.group_id || '').trim();
+  const phone = String(req.body?.phone || '').replace(/\D/g, '');
+  const groupType = String(req.body?.group_type || '');
+  const eventId = String(req.body?.event_id || '');
+
+  if (!groupId.endsWith('@g.us') || !/^\d{8,15}$/.test(phone)
+      || !['community', 'subgroup'].includes(groupType)
+      || !eventId || eventId.length > 128) {
+    return res.status(400).json({ error: 'invalid_access_add_payload' });
+  }
+
+  const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
+  if (!client) return;
+
+  const participantJid = phone + '@s.whatsapp.net';
+  try {
+    let participants: any[];
+    if (groupType === 'community') {
+      const community = await participatingCommunity(client, groupId, false);
+      if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
+      participants = community.participants || [];
+    } else {
+      const metadata = await getGroupMetadata(client, groupId, false);
+      participants = metadata.participants || [];
+    }
+
+    if (!isConnectedAccountAdmin(participants, client)) {
+      return res.status(403).json({ error: groupType === 'community' ? 'bot_must_be_community_admin' : 'bot_must_be_group_admin' });
+    }
+
+    const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
+    let alreadyPresent = existingJids.includes(participantJid);
+    if (!alreadyPresent) {
+      const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add');
+      if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
+        // WhatsApp can answer "bad-request" when the number is already present.
+        // Do one fresh lookup before deciding this is a real add failure.
+        let freshParticipants: any[];
+        if (groupType === 'community') {
+          const freshCommunity = await participatingCommunity(client, groupId, true);
+          if (!freshCommunity) return res.status(404).json({ error: 'whatsapp_community_not_found_after_add' });
+          freshParticipants = freshCommunity.participants || [];
+        } else {
+          const freshGroup = await getGroupMetadata(client, groupId, true);
+          freshParticipants = freshGroup.participants || [];
+        }
+        const freshJids = await Promise.all(freshParticipants.map((participant) => participantPhoneJid(client, participant)));
+        alreadyPresent = freshJids.includes(participantJid);
+        if (!alreadyPresent) return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
+      } else {
+        applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
+      }
+    }
+
+    // The WhatsApp add response or a participant snapshot is the confirmation.
+    // The database still changes to joined only after this signed webhook lands.
+    const delivered = await emitWebhook('whatsapp.participant_added', {
+      group_id: groupId,
+      participant_jid: participantJid,
+      action: 'add',
+      event_id: eventId,
+      source: 'database_access_worker',
+    });
+    if (!delivered) return res.status(503).json({ error: 'participant_confirmation_webhook_not_delivered' });
+
+    return res.json({ ok: true, added: !alreadyPresent, confirmed: true, event_id: eventId });
+  } catch (error) {
+    logger.warn({ groupId, error: safeError(error) }, 'Automatic WhatsApp participant addition failed');
+    return res.status(502).json({ error: 'automatic_participant_add_failed', message: safeError(error) });
+  }
+});
+
 app.use('/v1', requireToken);
 
 app.get('/v1/status', async (_req, res) => {
