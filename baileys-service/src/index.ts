@@ -64,8 +64,8 @@ let participatingGroupsCache: { expiresAt: number; value: Record<string, any> } 
 let participatingGroupsFetch: Promise<Record<string, any>> | null = null;
 const groupMetadataCache = new Map<string, { expiresAt: number; value: any }>();
 
-async function getParticipatingGroups(client: WASocket): Promise<Record<string, any>> {
-  if (participatingGroupsCache && participatingGroupsCache.expiresAt > Date.now()) return participatingGroupsCache.value;
+async function getParticipatingGroups(client: WASocket, forceRefresh = false): Promise<Record<string, any>> {
+  if (!forceRefresh && participatingGroupsCache && participatingGroupsCache.expiresAt > Date.now()) return participatingGroupsCache.value;
   if (participatingGroupsFetch) return participatingGroupsFetch;
   const request = client.groupFetchAllParticipating() as Promise<Record<string, any>>;
   participatingGroupsFetch = request;
@@ -387,8 +387,8 @@ function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string;
  * and communityMetadata() can fail for a parent container. Its group parser
  * exposes the same parent reliably through groupFetchAllParticipating().
  */
-async function participatingCommunity(client: WASocket, communityId: string): Promise<any | null> {
-  const groups = await getParticipatingGroups(client);
+async function participatingCommunity(client: WASocket, communityId: string, forceRefresh = false): Promise<any | null> {
+  const groups = await getParticipatingGroups(client, forceRefresh);
   const community = groups[communityId];
   if (!community?.isCommunity || community.isCommunityAnnounce) return null;
   return community;
@@ -565,7 +565,7 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
   try {
-    const community = await participatingCommunity(client, req.params.communityId);
+    const community = await participatingCommunity(client, req.params.communityId, true);
     if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
@@ -603,37 +603,21 @@ async function participantPhoneJid(client: any, participant: { id: string; jid?:
 }
 
 async function updateParticipantsRaw(client: WASocket & Record<string, any>, jid: string, participants: string[], action: 'add' | 'remove') {
-  const query = client.query;
-  if (typeof query !== 'function') throw new Error('Baileys query API is unavailable.');
-  const response = await query.call(client, {
-    tag: 'iq',
-    attrs: { type: 'set', xmlns: 'w:g2', to: jid },
-    content: [{
-      tag: action,
-      attrs: {},
-      content: participants.map((participant) => ({ tag: 'participant', attrs: { jid: participant } })),
-    }],
-  });
-  const actionNode = Array.isArray(response?.content)
-    ? response.content.find((node: any) => node?.tag === action)
-    : null;
-  const affected = Array.isArray(actionNode?.content)
-    ? actionNode.content.filter((node: any) => node?.tag === 'participant')
-    : [];
-  if (!affected.length) {
-    const errorCode = String(actionNode?.attrs?.error || response?.attrs?.error || '');
-    throw new Error(errorCode
-      ? `WhatsApp rejected participant ${action} (code ${errorCode}).`
-      : `WhatsApp returned no participant confirmation for ${action}.`);
+  const update = client.groupParticipantsUpdate;
+  if (typeof update !== 'function') throw new Error('Baileys groupParticipantsUpdate API is unavailable.');
+  const result = await update.call(client, jid, participants, action);
+  logger.info({ jid, action, participant_count: participants.length, result }, 'WhatsApp participant update response');
+  if (!Array.isArray(result) || result.length === 0) {
+    throw new Error('WhatsApp returned no participant confirmation for ' + action + '.');
   }
-  return affected.map((node: any) => ({ status: String(node?.attrs?.error || '200'), jid: String(node?.attrs?.jid || '') }));
+  return result.map((item: any) => ({ status: String(item?.status || '200'), jid: String(item?.jid || '') }));
 }
 
 app.get('/v1/communities/:communityId/participants', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
   try {
-    const community = await participatingCommunity(client, req.params.communityId);
+    const community = await participatingCommunity(client, req.params.communityId, req.query.fresh === 'true');
     if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
     const participants = await Promise.all((community.participants || []).map(async (participant: { id: string; jid?: string; phoneNumber?: string; admin?: string | null }) => ({
       id: participant.id,
@@ -661,7 +645,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     return res.status(400).json({ error: 'invalid_participant_id' });
   }
   try {
-    const community = await participatingCommunity(client, req.params.communityId);
+    const community = await participatingCommunity(client, req.params.communityId, true);
     if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
@@ -681,7 +665,7 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
   try {
-    const metadata = await getGroupMetadata(client, req.params.groupId);
+    const metadata = await getGroupMetadata(client, req.params.groupId, req.query.fresh === 'true');
     const participants = await Promise.all(metadata.participants.map(async (participant: { id: string; jid?: string; phoneNumber?: string; admin?: string | null }) => ({
       id: participant.id,
       jid: await participantPhoneJid(client, participant),
@@ -691,6 +675,29 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
     return res.json({ group_id: metadata.id, participants });
   } catch (error) {
     return res.status(502).json({ error: 'participants_fetch_failed', message: safeError(error) });
+  }
+});
+
+const profilePictureCache = new Map<string, { expiresAt: number; url: string | null }>();
+
+app.get('/v1/groups/:groupId/profile-picture', async (req, res) => {
+  const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
+  if (!client) return;
+  const jid = String(req.params.groupId || '');
+  const cached = profilePictureCache.get(jid);
+  if (cached && cached.expiresAt > Date.now()) return res.json({ group_id: jid, profile_picture_url: cached.url });
+  try {
+    if (typeof client.profilePictureUrl !== 'function') return res.status(501).json({ error: 'profile_picture_lookup_unavailable' });
+    const url = await client.profilePictureUrl(jid, 'image').catch((error: any) => {
+      if (Number(error?.output?.statusCode || error?.statusCode) === 404) return null;
+      throw error;
+    });
+    const safeUrl = typeof url === 'string' && url.startsWith('https://') ? url : null;
+    profilePictureCache.set(jid, { expiresAt: Date.now() + 6 * 60 * 60 * 1000, url: safeUrl });
+    return res.json({ group_id: jid, profile_picture_url: safeUrl });
+  } catch (error) {
+    logger.warn({ jid, error: safeError(error) }, 'Could not fetch WhatsApp group profile picture');
+    return res.status(502).json({ error: 'profile_picture_fetch_failed', message: safeError(error) });
   }
 });
 
