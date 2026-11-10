@@ -519,7 +519,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
 
     addressingMode = metadata.addressingMode;
     const participantJidForUpdate = await resolveParticipantJidForMetadata(client, participantJid, metadata);
-    logger.info({ groupId, groupType, addressingMode: addressingMode || 'unknown', participantAddressing: participantJidForUpdate.endsWith('@lid') ? 'lid' : 'pn' }, 'Resolved WhatsApp participant address');
+    logger.info({ groupId, groupType, addressingMode: addressingMode || 'unknown', memberAddMode: metadata.memberAddMode ?? null, joinApprovalMode: metadata.joinApprovalMode ?? null, participantAddressing: participantJidForUpdate.endsWith('@lid') ? 'lid' : 'pn' }, 'Resolved WhatsApp participant address');
     const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
     let alreadyPresent = existingJids.includes(participantPhoneJidValue);
     if (!alreadyPresent) {
@@ -549,6 +549,42 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
           whatsappNodeTag: errorObject?.data?.tag || null,
           whatsappChildTags: (errorObject?.data?.content || []).map((child) => child.tag).filter(Boolean),
         }, 'WhatsApp participant add query failed');
+      }
+
+      // Some WhatsApp Community backends reject LID-addressed add queries
+      // even when the PN↔LID mapping is valid. Try the verified PN JID once
+      // before declaring failure; the subsequent real socket event remains
+      // the only path that can confirm membership in Supabase.
+      if (addFailure && participantJidForUpdate.endsWith('@lid') && participantJid.endsWith('@s.whatsapp.net')) {
+        const primaryFailure = addFailure;
+        step = 'whatsapp_participant_add_phone_fallback';
+        try {
+          const fallbackResult = await updateParticipantsRaw(client, groupId, [participantJid], 'add', groupType === 'community');
+          if (fallbackResult.some((item: { status?: string }) => String(item.status) !== '200')) {
+            throw new Error('WhatsApp did not confirm the PN-addressed fallback add operation');
+          }
+          addFailure = null;
+          applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
+          logger.info({ groupId, groupType, addressingMode: addressingMode || 'unknown', participantAddressing: 'pn' }, 'WhatsApp accepted the PN-addressed participant add fallback');
+        } catch (fallbackError) {
+          addFailure = fallbackError;
+          const errorObject = fallbackError && typeof fallbackError === 'object' ? fallbackError as {
+            output?: { statusCode?: number; payload?: { message?: string } };
+            data?: { tag?: string; attrs?: { code?: string; text?: string; type?: string; error?: string }; content?: Array<{ tag?: string }> };
+          } : null;
+          logger.warn({
+            groupId,
+            groupType,
+            addressingMode: addressingMode || 'unknown',
+            primaryError: safeError(primaryFailure),
+            fallbackError: safeError(fallbackError),
+            whatsappStatusCode: errorObject?.output?.statusCode || null,
+            whatsappErrorText: errorObject?.output?.payload?.message || errorObject?.data?.attrs?.text || null,
+            whatsappErrorCode: errorObject?.data?.attrs?.code || errorObject?.data?.attrs?.error || null,
+            whatsappNodeTag: errorObject?.data?.tag || null,
+            whatsappChildTags: (errorObject?.data?.content || []).map((child) => child.tag).filter(Boolean),
+          }, 'WhatsApp PN-addressed participant add fallback failed');
+        }
       }
 
       if (addFailure) {
