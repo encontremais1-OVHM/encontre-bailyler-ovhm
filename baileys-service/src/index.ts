@@ -477,9 +477,17 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
 
-  const participantJid = phone + '@s.whatsapp.net';
-  let step = 'group_metadata_lookup';
+  let step = 'whatsapp_number_lookup';
   try {
+    const contacts = await client.onWhatsApp(phone);
+    const verifiedContact = contacts?.find((contact) => contact.exists && contact.jid);
+    if (!verifiedContact) {
+      return res.status(422).json({ error: 'phone_not_registered_on_whatsapp' });
+    }
+    const participantJid = verifiedContact.jid || phone + '@s.whatsapp.net';
+    const participantPhoneJidValue = phone + '@s.whatsapp.net';
+
+    step = 'group_metadata_lookup';
     let participants: any[];
     if (groupType === 'community') {
       const community = await participatingCommunity(client, groupId, false);
@@ -495,7 +503,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
     }
 
     const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
-    let alreadyPresent = existingJids.includes(participantJid);
+    let alreadyPresent = existingJids.includes(participantPhoneJidValue);
     if (!alreadyPresent) {
       let addFailure: unknown = null;
       step = 'whatsapp_participant_add';
@@ -532,7 +540,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
         }
 
         const freshJids = await Promise.all(freshParticipants.map((participant) => participantPhoneJid(client, participant)));
-        alreadyPresent = freshJids.includes(participantJid);
+        alreadyPresent = freshJids.includes(participantPhoneJidValue);
         if (!alreadyPresent) {
           return res.status(502).json({ error: 'participant_addition_not_confirmed', message: safeError(addFailure) });
         }
@@ -542,7 +550,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
     step = 'confirmation_webhook';
     const delivered = await emitWebhook('whatsapp.participant_added', {
       group_id: groupId,
-      participant_jid: participantJid,
+      participant_jid: participantPhoneJidValue,
       action: 'add',
       event_id: eventId,
       source: 'database_access_worker',
