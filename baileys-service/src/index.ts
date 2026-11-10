@@ -478,6 +478,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
   if (!client) return;
 
   const participantJid = phone + '@s.whatsapp.net';
+  let step = 'group_metadata_lookup';
   try {
     let participants: any[];
     if (groupType === 'community') {
@@ -496,29 +497,49 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
     const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
     let alreadyPresent = existingJids.includes(participantJid);
     if (!alreadyPresent) {
-      const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add');
-      if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
-        // WhatsApp can answer "bad-request" when the number is already present.
-        // Do one fresh lookup before deciding this is a real add failure.
-        let freshParticipants: any[];
-        if (groupType === 'community') {
-          const freshCommunity = await participatingCommunity(client, groupId, true);
-          if (!freshCommunity) return res.status(404).json({ error: 'whatsapp_community_not_found_after_add' });
-          freshParticipants = freshCommunity.participants || [];
+      let addFailure: unknown = null;
+      step = 'whatsapp_participant_add';
+      try {
+        const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add');
+        if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
+          addFailure = new Error('WhatsApp did not confirm the participant add operation');
         } else {
-          const freshGroup = await getGroupMetadata(client, groupId, true);
-          freshParticipants = freshGroup.participants || [];
+          applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
         }
+      } catch (error) {
+        addFailure = error;
+      }
+
+      if (addFailure) {
+        step = 'verify_existing_participant_after_add_error';
+        let freshParticipants: any[];
+        try {
+          if (groupType === 'community') {
+            const freshCommunity = await participatingCommunity(client, groupId, true);
+            if (!freshCommunity) return res.status(404).json({ error: 'whatsapp_community_not_found_after_add' });
+            freshParticipants = freshCommunity.participants || [];
+          } else {
+            const freshGroup = await getGroupMetadata(client, groupId, true);
+            freshParticipants = freshGroup.participants || [];
+          }
+        } catch (lookupError) {
+          logger.warn({ groupId, addError: safeError(addFailure), lookupError: safeError(lookupError) }, 'Could not verify participant after WhatsApp add error');
+          return res.status(502).json({
+            error: 'participant_addition_not_confirmed',
+            message: safeError(addFailure),
+            verification_error: safeError(lookupError),
+          });
+        }
+
         const freshJids = await Promise.all(freshParticipants.map((participant) => participantPhoneJid(client, participant)));
         alreadyPresent = freshJids.includes(participantJid);
-        if (!alreadyPresent) return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
-      } else {
-        applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
+        if (!alreadyPresent) {
+          return res.status(502).json({ error: 'participant_addition_not_confirmed', message: safeError(addFailure) });
+        }
       }
     }
 
-    // The WhatsApp add response or a participant snapshot is the confirmation.
-    // The database still changes to joined only after this signed webhook lands.
+    step = 'confirmation_webhook';
     const delivered = await emitWebhook('whatsapp.participant_added', {
       group_id: groupId,
       participant_jid: participantJid,
@@ -530,7 +551,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
 
     return res.json({ ok: true, added: !alreadyPresent, confirmed: true, event_id: eventId });
   } catch (error) {
-    logger.warn({ groupId, error: safeError(error) }, 'Automatic WhatsApp participant addition failed');
+    logger.warn({ groupId, step, error: safeError(error) }, 'Automatic WhatsApp participant addition failed');
     return res.status(502).json({ error: 'automatic_participant_add_failed', message: safeError(error) });
   }
 });
