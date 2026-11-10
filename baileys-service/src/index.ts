@@ -829,7 +829,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
     }
-    const result = await updateParticipantsRaw(client, req.params.communityId, [participant], action);
+    const result = await updateParticipantsRaw(client, req.params.communityId, [participant], action, true);
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'community_participant_update_not_confirmed', result });
     }
