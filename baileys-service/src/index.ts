@@ -8,7 +8,6 @@ import makeWASocket, {
   WASocket,
   BaileysEventMap,
 } from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs/promises';
@@ -577,14 +576,17 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
 
     return res.json({ ok: true, added: !alreadyPresent, confirmed: true, event_id: eventId });
   } catch (error) {
-    const boom = error instanceof Boom ? error : null;
-    const errorData = boom?.data as { attrs?: { code?: string; text?: string } } | undefined;
+    const errorObject = error && typeof error === 'object' ? error as {
+      output?: { statusCode?: number };
+      data?: { attrs?: { code?: string; text?: string } };
+    } : null;
+    const errorData = errorObject?.data;
     logger.warn({
       groupId,
       step,
       addressingMode: addressingMode || 'unknown',
       error: safeError(error),
-      whatsappStatusCode: boom?.output?.statusCode || null,
+      whatsappStatusCode: errorObject?.output?.statusCode || null,
       whatsappErrorCode: errorData?.attrs?.code || null,
       whatsappErrorText: errorData?.attrs?.text || null,
     }, 'Automatic WhatsApp participant addition failed');
