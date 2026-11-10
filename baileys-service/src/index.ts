@@ -12,7 +12,7 @@ import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'node:fs/promises';
-import { timingSafeEqual, createHmac } from 'node:crypto';
+import { timingSafeEqual, createHmac, randomUUID } from 'node:crypto';
 
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -167,7 +167,7 @@ async function emitWebhook(event: string, details: Record<string, unknown> = {})
   const url = process.env.WEBHOOK_URL;
   if (!url) return;
   try {
-    const body = JSON.stringify({ event, occurred_at: new Date().toISOString(), ...details });
+    const body = JSON.stringify({ event, event_id: randomUUID(), occurred_at: new Date().toISOString(), ...details });
     const secret = process.env.WEBHOOK_SECRET || '';
     const signature = createHmac('sha256', secret).update(body).digest('hex');
     await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-encontre-signature': signature }, body, signal: AbortSignal.timeout(8000) });
@@ -223,10 +223,8 @@ async function startSocket(forceFresh = false): Promise<void> {
           });
       });
       nextSocket.ev.on('group-participants.update', (update) => {
-        // Participant changes do not change the list of joined groups. Keep
-        // the expensive participating-groups snapshot warm and patch its
-        // participant list locally so the immediate post-add verification
-        // does not issue another rate-limited WhatsApp query.
+        // This event is emitted by WhatsApp after a real participant change.
+        // It is therefore the authoritative signal for the confirmation webhook.
         applyParticipantUpdateToCachedGroups(update);
         logger.info({ groupId: update.id, action: update.action, participantCount: update.participants?.length || 0 }, 'WhatsApp participant update received');
         void emitWebhook('whatsapp.participants_update', {
@@ -234,6 +232,24 @@ async function startSocket(forceFresh = false): Promise<void> {
           action: update.action,
           participant_count: update.participants?.length || 0,
         });
+        if (update.action === 'add') {
+          for (const participantId of update.participants || []) {
+            void (async () => {
+              const participantJid = await participantPhoneJid(nextSocket, { id: String(participantId) });
+              if (!participantJid) {
+                logger.warn({ groupId: update.id }, 'Participant add event could not be mapped to a phone JID; confirmation webhook skipped');
+                return;
+              }
+              await emitWebhook('whatsapp.participant_added', {
+                group_id: update.id,
+                participant_jid: participantJid,
+                action: 'add',
+              });
+            })().catch((error) => {
+              logger.warn({ groupId: update.id, error: safeError(error) }, 'Could not send participant confirmation webhook');
+            });
+          }
+        }
       });
       nextSocket.ev.on('connection.update', async (update) => {
         if (update.qr) {
