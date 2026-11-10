@@ -696,7 +696,7 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
   const phone = String(req.body?.phone || '').replace(/\D/g, '');
   if (!/^\d{8,15}$/.test(phone)) return res.status(400).json({ error: 'invalid_phone' });
   try {
-    const metadata = await client.groupMetadata(req.params.groupId);
+    const metadata = await getGroupMetadata(client, req.params.groupId, true);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
     const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
