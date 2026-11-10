@@ -54,6 +54,39 @@ let reconnectAllowed = true;
 let reconnectAttempts = 0;
 let socketGeneration = 0;
 let pairingInProgress = false;
+const WHATSAPP_METADATA_CACHE_MS = 15_000;
+let participatingGroupsCache: { expiresAt: number; value: Record<string, any> } | null = null;
+let participatingGroupsFetch: Promise<Record<string, any>> | null = null;
+const groupMetadataCache = new Map<string, { expiresAt: number; value: any }>();
+
+async function getParticipatingGroups(client: WASocket): Promise<Record<string, any>> {
+  if (participatingGroupsCache && participatingGroupsCache.expiresAt > Date.now()) return participatingGroupsCache.value;
+  if (participatingGroupsFetch) return participatingGroupsFetch;
+  const request = client.groupFetchAllParticipating() as Promise<Record<string, any>>;
+  participatingGroupsFetch = request;
+  try {
+    const value = await request;
+    participatingGroupsCache = { expiresAt: Date.now() + WHATSAPP_METADATA_CACHE_MS, value };
+    return value;
+  } finally {
+    if (participatingGroupsFetch === request) participatingGroupsFetch = null;
+  }
+}
+
+async function getGroupMetadata(client: WASocket, groupId: string, forceRefresh = false): Promise<any> {
+  const cached = groupMetadataCache.get(groupId);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached.value;
+  const value = await client.groupMetadata(groupId);
+  groupMetadataCache.set(groupId, { expiresAt: Date.now() + WHATSAPP_METADATA_CACHE_MS, value });
+  return value;
+}
+
+function invalidateGroupMetadata(groupId?: string) {
+  participatingGroupsCache = null;
+  if (groupId) groupMetadataCache.delete(groupId);
+  else groupMetadataCache.clear();
+}
+
 let qrExpiresAt: number | null = null;
 
 function requireToken(req: Request, res: Response, next: NextFunction) {
@@ -161,6 +194,15 @@ async function startSocket(forceFresh = false): Promise<void> {
           .catch((error) => {
             logger.error({ error: safeError(error) }, 'Could not persist WhatsApp credentials');
           });
+      });
+      nextSocket.ev.on('group-participants.update', (update) => {
+        invalidateGroupMetadata(update.id);
+        logger.info({ groupId: update.id, action: update.action, participantCount: update.participants?.length || 0 }, 'WhatsApp participant update received');
+        void emitWebhook('whatsapp.participants_update', {
+          group_id: update.id,
+          action: update.action,
+          participant_count: update.participants?.length || 0,
+        });
       });
       nextSocket.ev.on('connection.update', async (update) => {
         if (update.qr) {
@@ -304,7 +346,7 @@ function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string;
  * exposes the same parent reliably through groupFetchAllParticipating().
  */
 async function participatingCommunity(client: WASocket, communityId: string): Promise<any | null> {
-  const groups = await client.groupFetchAllParticipating() as Record<string, any>;
+  const groups = await getParticipatingGroups(client);
   const community = groups[communityId];
   if (!community?.isCommunity || community.isCommunityAnnounce) return null;
   return community;
@@ -405,7 +447,7 @@ app.get('/v1/groups', async (_req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
   try {
-    const groups = await client.groupFetchAllParticipating();
+    const groups = await getParticipatingGroups(client);
     return res.json({ groups: Object.values(groups).map(group => ({
       id: group.id, subject: group.subject, description: group.desc || null,
       owner: group.owner || null, size: group.participants?.length || 0,
@@ -419,11 +461,10 @@ app.get('/v1/communities', async (_req, res) => {
   const client = connectedSocket(res) as any;
   if (!client) return;
   try {
-    const [communities, groups] = await Promise.all([
-      client.communityFetchAllParticipating(),
-      client.groupFetchAllParticipating(),
-    ]);
-    const communityEntries = Object.values(communities) as any[];
+    // The group parser exposes parent Community containers as isCommunity.
+    // Avoid a second full-participation query: WhatsApp rate-limits this endpoint.
+    const groups = await getParticipatingGroups(client);
+    const communityEntries: any[] = [];
     const groupEntries = Object.values(groups) as any[];
 
     // Baileys 6.7.24 can return an empty "communities" collection because
@@ -553,9 +594,10 @@ app.get('/v1/communities/:communityId/participants', async (req, res) => {
   try {
     const community = await participatingCommunity(client, req.params.communityId);
     if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
-    const participants = await Promise.all((community.participants || []).map(async (participant: { id: string; jid?: string; admin?: string | null }) => ({
+    const participants = await Promise.all((community.participants || []).map(async (participant: { id: string; jid?: string; phoneNumber?: string; admin?: string | null }) => ({
       id: participant.id,
       jid: await participantPhoneJid(client, participant),
+      phoneNumber: participant.phoneNumber || null,
       admin: participant.admin || null,
     })));
     return res.json({ community_id: req.params.communityId, participants });
@@ -587,6 +629,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'community_participant_update_not_confirmed', result });
     }
+    invalidateGroupMetadata(req.params.communityId);
     return res.json({ community_id: req.params.communityId, participant, action, result });
   } catch (error) {
     return res.status(502).json({ error: `community_participant_${action}_failed`, message: safeError(error) });
@@ -597,9 +640,12 @@ app.get('/v1/groups/:groupId/participants', async (req, res) => {
   const client = connectedSocket(res) as (WASocket & Record<string, any>) | null;
   if (!client) return;
   try {
-    const metadata = await client.groupMetadata(req.params.groupId);
+    const metadata = await getGroupMetadata(client, req.params.groupId);
     const participants = await Promise.all(metadata.participants.map(async (participant) => ({
-      id: participant.id, jid: await participantPhoneJid(client, participant), admin: participant.admin || null,
+      id: participant.id,
+      jid: await participantPhoneJid(client, participant),
+      phoneNumber: participant.phoneNumber || null,
+      admin: participant.admin || null,
     })));
     return res.json({ group_id: metadata.id, participants });
   } catch (error) {
@@ -611,7 +657,7 @@ app.get('/v1/groups/:groupId/invite-link', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
   try {
-    const metadata = await client.groupMetadata(req.params.groupId);
+    const metadata = await getGroupMetadata(client, req.params.groupId);
     if (!isConnectedAccountAdmin(metadata.participants, client)) {
       return res.status(403).json({ error: 'bot_must_be_group_admin' });
     }
@@ -631,12 +677,13 @@ app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
     return res.status(400).json({ error: 'invalid_participant_id' });
   }
   try {
-    const metadata = await client.groupMetadata(req.params.groupId);
+    const metadata = await getGroupMetadata(client, req.params.groupId, true);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
     const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [participant], 'remove');
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_removal_not_confirmed', result });
     }
+    invalidateGroupMetadata(req.params.groupId);
     return res.json({ group_id: req.params.groupId, participant, result });
   } catch (error) {
     return res.status(502).json({ error: 'participant_removal_failed', message: safeError(error) });
@@ -655,6 +702,7 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
     }
+    invalidateGroupMetadata(req.params.groupId);
     return res.json({ group_id: req.params.groupId, phone, result });
   } catch (error) {
     return res.status(502).json({ error: 'participant_addition_failed', message: safeError(error) });
