@@ -616,7 +616,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
   }
   const phone = String(req.body?.phone || '').replace(/\D/g, '');
   const participant = action === 'remove' ? String(req.body?.participant || '') : `${phone}@s.whatsapp.net`;
-  if (!participant || participant.length > 100 || !/^[0-9]+@s\.whatsapp\.net$/.test(participant)) {
+  if (!participant || participant.length > 100 || !/^(?:[0-9]+@s\.whatsapp\.net|[0-9]+@lid)$/.test(participant)) {
     return res.status(400).json({ error: 'invalid_participant_id' });
   }
   try {
