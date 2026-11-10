@@ -91,6 +91,20 @@ function invalidateGroupMetadata(groupId?: string) {
   else groupMetadataCache.clear();
 }
 
+function applyParticipantUpdateToCachedGroups(update: { id: string; participants?: string[]; action?: string }) {
+  const group = participatingGroupsCache?.value?.[update.id];
+  if (!group || !Array.isArray(group.participants)) return;
+  const incoming = (update.participants || []).map((id) => ({ id, jid: id, phoneNumber: String(id).endsWith('@s.whatsapp.net') ? id : null }));
+  const keys = new Set(incoming.map((participant) => jidUser(participant.id)));
+  if (update.action === 'add') {
+    const existing = new Set(group.participants.map((participant: any) => jidUser(participant.id || participant.jid)));
+    group.participants.push(...incoming.filter((participant) => !existing.has(jidUser(participant.id))));
+  } else if (update.action === 'remove') {
+    group.participants = group.participants.filter((participant: any) => !keys.has(jidUser(participant.id || participant.jid)));
+  }
+  groupMetadataCache.delete(update.id);
+}
+
 let qrExpiresAt: number | null = null;
 
 function requireToken(req: Request, res: Response, next: NextFunction) {
@@ -200,7 +214,11 @@ async function startSocket(forceFresh = false): Promise<void> {
           });
       });
       nextSocket.ev.on('group-participants.update', (update) => {
-        invalidateGroupMetadata(update.id);
+        // Participant changes do not change the list of joined groups. Keep
+        // the expensive participating-groups snapshot warm and patch its
+        // participant list locally so the immediate post-add verification
+        // does not issue another rate-limited WhatsApp query.
+        applyParticipantUpdateToCachedGroups(update);
         logger.info({ groupId: update.id, action: update.action, participantCount: update.participants?.length || 0 }, 'WhatsApp participant update received');
         void emitWebhook('whatsapp.participants_update', {
           group_id: update.id,
@@ -626,7 +644,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'community_participant_update_not_confirmed', result });
     }
-    invalidateGroupMetadata(req.params.communityId);
+    applyParticipantUpdateToCachedGroups({ id: req.params.communityId, participants: [participant], action });
     return res.json({ community_id: req.params.communityId, participant, action, result });
   } catch (error) {
     return res.status(502).json({ error: `community_participant_${action}_failed`, message: safeError(error) });
