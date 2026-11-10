@@ -534,6 +534,21 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
         }
       } catch (error) {
         addFailure = error;
+        const errorObject = error && typeof error === 'object' ? error as {
+          output?: { statusCode?: number; payload?: { message?: string } };
+          data?: { tag?: string; attrs?: { code?: string; text?: string; type?: string; error?: string }; content?: Array<{ tag?: string }> };
+        } : null;
+        logger.warn({
+          groupId,
+          groupType,
+          addressingMode: addressingMode || 'unknown',
+          error: safeError(error),
+          whatsappStatusCode: errorObject?.output?.statusCode || null,
+          whatsappErrorText: errorObject?.output?.payload?.message || errorObject?.data?.attrs?.text || null,
+          whatsappErrorCode: errorObject?.data?.attrs?.code || errorObject?.data?.attrs?.error || null,
+          whatsappNodeTag: errorObject?.data?.tag || null,
+          whatsappChildTags: (errorObject?.data?.content || []).map((child) => child.tag).filter(Boolean),
+        }, 'WhatsApp participant add query failed');
       }
 
       if (addFailure) {
