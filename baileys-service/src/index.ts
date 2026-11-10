@@ -489,12 +489,14 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
 
     step = 'group_metadata_lookup';
     let participants: any[];
+    let metadata: any;
     if (groupType === 'community') {
       const community = await participatingCommunity(client, groupId, false);
       if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
+      metadata = community;
       participants = community.participants || [];
     } else {
-      const metadata = await getGroupMetadata(client, groupId, false);
+      metadata = await getGroupMetadata(client, groupId, false);
       participants = metadata.participants || [];
     }
 
@@ -502,17 +504,18 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
       return res.status(403).json({ error: groupType === 'community' ? 'bot_must_be_community_admin' : 'bot_must_be_group_admin' });
     }
 
+    const participantJidForUpdate = await resolveParticipantJidForMetadata(client, participantJid, metadata);
     const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
     let alreadyPresent = existingJids.includes(participantPhoneJidValue);
     if (!alreadyPresent) {
       let addFailure: unknown = null;
       step = 'whatsapp_participant_add';
       try {
-        const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add', groupType === 'community');
+        const result = await updateParticipantsRaw(client, groupId, [participantJidForUpdate], 'add', groupType === 'community');
         if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
           addFailure = new Error('WhatsApp did not confirm the participant add operation');
         } else {
-          applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
+          applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJidForUpdate], action: 'add' });
         }
       } catch (error) {
         addFailure = error;
@@ -771,6 +774,27 @@ async function participantPhoneJid(client: any, participant: { id: string; jid?:
   return null;
 }
 
+async function resolveParticipantJidForMetadata(
+  client: WASocket & Record<string, any>,
+  participantJid: string,
+  metadata: { addressingMode?: string }
+): Promise<string> {
+  if (participantJid.endsWith('@lid') || metadata.addressingMode !== 'lid') return participantJid;
+
+  const mapping = client.signalRepository?.lidMapping;
+  const resolver = mapping?.getLIDForPN;
+  if (typeof resolver !== 'function') {
+    throw new Error('This WhatsApp chat requires LID addressing, but the active Baileys version has no PN-to-LID resolver.');
+  }
+
+  const lidJid = await resolver.call(mapping, participantJid);
+  if (typeof lidJid !== 'string' || !lidJid.endsWith('@lid')) {
+    throw new Error('WhatsApp requires a LID for this chat, but the participant LID could not be resolved from the registered phone number.');
+  }
+
+  return lidJid;
+}
+
 async function updateParticipantsRaw(
   client: WASocket & Record<string, any>,
   jid: string,
@@ -829,11 +853,12 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
     }
-    const result = await updateParticipantsRaw(client, req.params.communityId, [participant], action, true);
+    const participantJidForUpdate = await resolveParticipantJidForMetadata(client, participant, community);
+    const result = await updateParticipantsRaw(client, req.params.communityId, [participantJidForUpdate], action, true);
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'community_participant_update_not_confirmed', result });
     }
-    applyParticipantUpdateToCachedGroups({ id: req.params.communityId, participants: [participant], action });
+    applyParticipantUpdateToCachedGroups({ id: req.params.communityId, participants: [participantJidForUpdate], action });
     return res.json({ community_id: req.params.communityId, participant, action, result });
   } catch (error) {
     return res.status(502).json({ error: `community_participant_${action}_failed`, message: safeError(error) });
@@ -906,7 +931,8 @@ app.post('/v1/groups/:groupId/participants/remove', async (req, res) => {
   try {
     const metadata = await getGroupMetadata(client, req.params.groupId, true);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
-    const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [participant], 'remove');
+    const participantJidForUpdate = await resolveParticipantJidForMetadata(client as WASocket & Record<string, any>, participant, metadata);
+    const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [participantJidForUpdate], 'remove');
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_removal_not_confirmed', result });
     }
@@ -925,7 +951,8 @@ app.post('/v1/groups/:groupId/participants/add', async (req, res) => {
   try {
     const metadata = await getGroupMetadata(client, req.params.groupId, true);
     if (!isConnectedAccountAdmin(metadata.participants, client)) return res.status(403).json({ error: 'bot_must_be_group_admin' });
-    const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [phone + '@s.whatsapp.net'], 'add');
+    const participantJidForUpdate = await resolveParticipantJidForMetadata(client as WASocket & Record<string, any>, phone + '@s.whatsapp.net', metadata);
+    const result = await updateParticipantsRaw(client as WASocket & Record<string, any>, req.params.groupId, [participantJidForUpdate], 'add');
     if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
       return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
     }
