@@ -478,6 +478,7 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
   if (!client) return;
 
   let step = 'whatsapp_number_lookup';
+  let addressingMode: string | undefined;
   try {
     const participantPhoneJidValue = phone + '@s.whatsapp.net';
     const contacts = await client.onWhatsApp(participantPhoneJidValue);
@@ -504,7 +505,9 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
       return res.status(403).json({ error: groupType === 'community' ? 'bot_must_be_community_admin' : 'bot_must_be_group_admin' });
     }
 
+    addressingMode = metadata.addressingMode;
     const participantJidForUpdate = await resolveParticipantJidForMetadata(client, participantJid, metadata);
+    logger.info({ groupId, groupType, addressingMode: addressingMode || 'unknown', participantAddressing: participantJidForUpdate.endsWith('@lid') ? 'lid' : 'pn' }, 'Resolved WhatsApp participant address');
     const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
     let alreadyPresent = existingJids.includes(participantPhoneJidValue);
     if (!alreadyPresent) {
@@ -562,7 +565,17 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
 
     return res.json({ ok: true, added: !alreadyPresent, confirmed: true, event_id: eventId });
   } catch (error) {
-    logger.warn({ groupId, step, error: safeError(error) }, 'Automatic WhatsApp participant addition failed');
+    const boom = error instanceof Boom ? error : null;
+    const errorData = boom?.data as { attrs?: { code?: string; text?: string } } | undefined;
+    logger.warn({
+      groupId,
+      step,
+      addressingMode: addressingMode || 'unknown',
+      error: safeError(error),
+      whatsappStatusCode: boom?.output?.statusCode || null,
+      whatsappErrorCode: errorData?.attrs?.code || null,
+      whatsappErrorText: errorData?.attrs?.text || null,
+    }, 'Automatic WhatsApp participant addition failed');
     return res.status(502).json({ error: 'automatic_participant_add_failed', message: safeError(error) });
   }
 });
