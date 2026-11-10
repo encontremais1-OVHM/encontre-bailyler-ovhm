@@ -580,17 +580,17 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
       }
     }
 
-    step = 'confirmation_webhook';
-    const delivered = await emitWebhook('whatsapp.participant_added', {
-      group_id: groupId,
-      participant_jid: participantPhoneJidValue,
-      action: 'add',
-      event_id: eventId,
-      source: 'database_access_worker',
+    // The request response is not proof of membership. The only event allowed
+    // to activate access is the real group-participants.update notification
+    // received from WhatsApp and forwarded by the socket event listener above.
+    step = 'awaiting_whatsapp_participant_event';
+    return res.status(202).json({
+      ok: true,
+      requested: !alreadyPresent,
+      already_present: alreadyPresent,
+      confirmed: false,
+      awaiting_event: 'group-participants.update',
     });
-    if (!delivered) return res.status(503).json({ error: 'participant_confirmation_webhook_not_delivered' });
-
-    return res.json({ ok: true, added: !alreadyPresent, confirmed: true, event_id: eventId });
   } catch (error) {
     const errorObject = error && typeof error === 'object' ? error as {
       output?: { statusCode?: number };
