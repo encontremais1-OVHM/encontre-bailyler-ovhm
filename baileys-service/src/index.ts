@@ -479,13 +479,13 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
 
   let step = 'whatsapp_number_lookup';
   try {
-    const contacts = await client.onWhatsApp(phone);
+    const participantPhoneJidValue = phone + '@s.whatsapp.net';
+    const contacts = await client.onWhatsApp(participantPhoneJidValue);
     const verifiedContact = contacts?.find((contact) => contact.exists && contact.jid);
     if (!verifiedContact) {
       return res.status(422).json({ error: 'phone_not_registered_on_whatsapp' });
     }
-    const participantJid = verifiedContact.jid || phone + '@s.whatsapp.net';
-    const participantPhoneJidValue = phone + '@s.whatsapp.net';
+    const participantJid = verifiedContact.jid || participantPhoneJidValue;
 
     step = 'group_metadata_lookup';
     let participants: any[];
