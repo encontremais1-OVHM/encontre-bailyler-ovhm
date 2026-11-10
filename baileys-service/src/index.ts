@@ -99,10 +99,20 @@ function invalidateGroupMetadata(groupId?: string) {
   else groupMetadataCache.clear();
 }
 
-function applyParticipantUpdateToCachedGroups(update: { id: string; participants?: string[]; action?: string }) {
+function applyParticipantUpdateToCachedGroups(update: {
+  id: string;
+  participants?: Array<string | { id?: string; phoneNumber?: string; lid?: string }>;
+  action?: string;
+}) {
   const group = participatingGroupsCache?.value?.[update.id];
   if (!group || !Array.isArray(group.participants)) return;
-  const incoming = (update.participants || []).map((id) => ({ id, jid: id, phoneNumber: String(id).endsWith('@s.whatsapp.net') ? id : null }));
+  const incoming = (update.participants || []).map((participant) => {
+    const id = typeof participant === 'string' ? participant : String(participant.id || participant.lid || participant.phoneNumber || '');
+    const phoneNumber = typeof participant === 'string'
+      ? (participant.endsWith('@s.whatsapp.net') ? participant : null)
+      : (participant.phoneNumber || (id.endsWith('@s.whatsapp.net') ? id : null));
+    return { id, phoneNumber, lid: typeof participant === 'string' ? (id.endsWith('@lid') ? id : null) : (participant.lid || (id.endsWith('@lid') ? id : null)) };
+  }).filter((participant) => Boolean(participant.id));
   const keys = new Set(incoming.map((participant) => jidUser(participant.id)));
   if (update.action === 'add') {
     const existing = new Set(group.participants.map((participant: any) => jidUser(participant.id || participant.jid)));
@@ -281,9 +291,9 @@ async function startSocket(forceFresh = false): Promise<void> {
           participant_count: update.participants?.length || 0,
         });
         if (update.action === 'add') {
-          for (const participantId of update.participants || []) {
+          for (const participant of update.participants || []) {
             void (async () => {
-              const participantJid = await participantPhoneJid(nextSocket, { id: String(participantId) });
+              const participantJid = await participantPhoneJid(nextSocket, typeof participant === 'string' ? { id: participant } : participant);
               if (!participantJid) {
                 logger.warn({ groupId: update.id }, 'Participant add event could not be mapped to a phone JID; confirmation webhook skipped');
                 return;
@@ -439,17 +449,19 @@ function jidUser(value: string | undefined): string {
   return String(value || '').split(':')[0].split('@')[0];
 }
 
-function isConnectedAccountAdmin(participants: Array<{ id: string; jid?: string; phoneNumber?: string; admin?: string | null }>, client: WASocket): boolean {
-  const self = jidUser(client.user?.jid || client.user?.id);
-  return Boolean(self && participants.some((participant) =>
-    (jidUser(participant.id) === self || jidUser(participant.jid) === self || jidUser(participant.phoneNumber) === self) && Boolean(participant.admin)
-  ));
+function isConnectedAccountAdmin(
+  participants: Array<{ id: string; phoneNumber?: string; lid?: string; admin?: string | null }>,
+  client: WASocket
+): boolean {
+  const selfIds = [client.user?.id, client.user?.phoneNumber, client.user?.lid].filter(Boolean).map((value) => jidUser(String(value)));
+  return selfIds.length > 0 && participants.some((participant) =>
+    [participant.id, participant.phoneNumber, participant.lid].some((value) => selfIds.includes(jidUser(value))) && Boolean(participant.admin)
+  );
 }
 
 /**
- * Baileys 6.7.24 may omit communities from communityFetchAllParticipating()
- * and communityMetadata() can fail for a parent container. Its group parser
- * exposes the same parent reliably through groupFetchAllParticipating().
+ * Use the participating group metadata cache for Community parent JIDs; the
+ * returned metadata includes isCommunity and addressingMode for LID resolution.
  */
 async function participatingCommunity(client: WASocket, communityId: string, forceRefresh = false): Promise<any | null> {
   const groups = await getParticipatingGroups(client, forceRefresh);
@@ -767,10 +779,13 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
   }
 });
 
-async function participantPhoneJid(client: any, participant: { id: string; jid?: string | null; phoneNumber?: string | null }): Promise<string | null> {
+async function participantPhoneJid(
+  client: any,
+  participant: { id?: string; lid?: string | null; phoneNumber?: string | null }
+): Promise<string | null> {
   const phoneNumber = String(participant.phoneNumber || '');
   if (phoneNumber.endsWith('@s.whatsapp.net')) return phoneNumber;
-  const supplied = String(participant.jid || participant.id || '');
+  const supplied = String(participant.id || participant.lid || '');
   if (supplied.endsWith('@s.whatsapp.net')) return supplied;
   if (supplied.endsWith('@lid')) {
     try {
