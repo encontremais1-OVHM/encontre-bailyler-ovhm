@@ -464,11 +464,11 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-b
 // Postgres can request additions without exposing the general API_TOKEN.
 app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (req, res) => {
   const groupId = String(req.body?.group_id || '').trim();
-  const phone = String(req.body?.phone || '').replace(/\\D/g, '');
+  const phone = String(req.body?.phone || '').replace(/\D/g, '');
   const groupType = String(req.body?.group_type || '');
   const eventId = String(req.body?.event_id || '');
 
-  if (!groupId.endsWith('@g.us') || !/^\\d{8,15}$/.test(phone)
+  if (!groupId.endsWith('@g.us') || !/^\d{8,15}$/.test(phone)
       || !['community', 'subgroup'].includes(groupType)
       || !eventId || eventId.length > 128) {
     return res.status(400).json({ error: 'invalid_access_add_payload' });
