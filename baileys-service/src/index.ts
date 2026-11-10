@@ -734,7 +734,7 @@ app.get('/v1/communities/:communityId/invite-link', async (req, res) => {
   const client = connectedSocket(res);
   if (!client) return;
   try {
-    const community = await participatingCommunity(client, req.params.communityId, true);
+    const community = await participatingCommunity(client, req.params.communityId, false);
     if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
