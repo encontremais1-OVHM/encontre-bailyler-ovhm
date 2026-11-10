@@ -50,6 +50,8 @@ let pairingCode: string | null = null;
 let lastError: string | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let startPromise: Promise<void> | null = null;
+let startupPromise: Promise<void> | null = null;
+let credentialSaveQueue: Promise<void> = Promise.resolve();
 let reconnectAllowed = true;
 let reconnectAttempts = 0;
 let socketGeneration = 0;
@@ -205,7 +207,6 @@ async function startSocket(forceFresh = false): Promise<void> {
       sock = nextSocket;
       // EventEmitter does not await async listeners. Serialize credential writes
       // and wait for them before handling a restart-required (515) close.
-      let credentialSaveQueue = Promise.resolve();
       nextSocket.ev.on('creds.update', () => {
         credentialSaveQueue = credentialSaveQueue
           .then(() => saveCreds())
@@ -236,6 +237,17 @@ async function startSocket(forceFresh = false): Promise<void> {
           await emitWebhook('whatsapp.qr_ready');
         }
         if (update.connection === 'open') {
+          // Force one final credential write on every successful connection.
+          // This closes the gap between the QR/pairing handshake and a Railway
+          // restart/deploy, where an async creds.update write could be pending.
+          await credentialSaveQueue;
+          try {
+            await saveCreds();
+            await credentialSaveQueue;
+            logger.info({ registered: Boolean(authState.creds.registered), auth_directory: activeAuthDir }, 'WhatsApp credentials persisted after connection');
+          } catch (error) {
+            logger.error({ error: safeError(error) }, 'Could not persist credentials after WhatsApp connection');
+          }
           state = 'connected';
           qrText = null;
           qrDataUrl = null;
@@ -377,19 +389,25 @@ async function participatingCommunity(client: WASocket, communityId: string): Pr
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'encontre-plus-baileys', timestamp: new Date().toISOString() }));
 app.use('/v1', requireToken);
 
-app.get('/v1/status', (_req, res) => res.json({
-  state,
-  connected: state === 'connected',
-  has_qr: Boolean(qrDataUrl),
-  has_pairing_code: Boolean(pairingCode),
-  pairing_in_progress: pairingInProgress,
-  qr_expires_at: qrExpiresAt ? new Date(qrExpiresAt).toISOString() : null,
-  last_error: lastError,
-  phone: sock?.user?.id?.split(':')[0] || null,
-}));
+app.get('/v1/status', async (_req, res) => {
+  // Do not report a false "disconnected" state while the persistent volume is
+  // still being inspected/restored during a Railway cold start.
+  if (startupPromise) await startupPromise.catch(() => undefined);
+  return res.json({
+    state,
+    connected: state === 'connected',
+    has_qr: Boolean(qrDataUrl),
+    has_pairing_code: Boolean(pairingCode),
+    pairing_in_progress: pairingInProgress,
+    qr_expires_at: qrExpiresAt ? new Date(qrExpiresAt).toISOString() : null,
+    last_error: lastError,
+    phone: sock?.user?.id?.split(':')[0] || null,
+  });
+});
 
 app.post('/v1/connect', async (_req, res) => {
   try {
+    if (startupPromise) await startupPromise.catch(() => undefined);
     if (pairingInProgress) return res.status(409).json({ error: 'pairing_in_progress', message: 'A vinculação por código já está em andamento.' });
     if (state === 'connected') return res.json({ state, message: 'Already connected' });
     if (state === 'connecting' && sock) return res.status(202).json({ state: 'connecting', message: 'Connection already in progress; poll /v1/qr or /v1/status' });
@@ -782,7 +800,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, HOST, () => {
   logger.info({ host: HOST, port: PORT }, 'Encontre + Baileys service listening');
-  void resolveAuthDirectory().then(async (resolvedDirectory) => {
+  startupPromise = resolveAuthDirectory().then(async (resolvedDirectory) => {
     activeAuthDir = resolvedDirectory;
     await fs.mkdir(activeAuthDir, { recursive: true });
     const authEntries = await fs.readdir(activeAuthDir).catch(() => [] as string[]);
@@ -793,14 +811,17 @@ const server = app.listen(PORT, HOST, () => {
     logger.info({ authDir: activeAuthDir, volumePath: VOLUME_PATH, authEntries, volumeEntries }, 'WhatsApp persistent auth storage diagnostic');
     const { state: authState } = await useMultiFileAuthState(activeAuthDir);
     if (authState.creds.registered) {
-      logger.info('Persisted WhatsApp session found; restoring connection');
+      logger.info({ registered: true, auth_directory: activeAuthDir }, 'Persisted WhatsApp session found; restoring connection');
+      reconnectAllowed = true;
       await startSocket();
     } else {
       state = 'disconnected';
-      logger.info('No paired WhatsApp session found; waiting for an explicit connection request');
+      logger.info({ registered: false, auth_directory: activeAuthDir }, 'No paired WhatsApp session found; waiting for an explicit connection request');
     }
   }).catch(error => {
-    logger.error({ error: safeError(error) }, 'Initial WhatsApp startup failed; use /v1/connect to retry');
+    state = 'error';
+    lastError = safeError(error);
+    logger.error({ error: lastError }, 'Initial WhatsApp startup failed; status will report an error instead of disconnected');
   });
 });
 
