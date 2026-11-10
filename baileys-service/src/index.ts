@@ -481,11 +481,11 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
   try {
     let participants: any[];
     if (groupType === 'community') {
-      const community = await participatingCommunity(client, groupId, true);
+      const community = await participatingCommunity(client, groupId, false);
       if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
       participants = community.participants || [];
     } else {
-      const metadata = await getGroupMetadata(client, groupId, true);
+      const metadata = await getGroupMetadata(client, groupId, false);
       participants = metadata.participants || [];
     }
 
@@ -494,31 +494,31 @@ app.post('/internal/whatsapp/participants/add', requireWebhookSignature, async (
     }
 
     const existingJids = await Promise.all(participants.map((participant) => participantPhoneJid(client, participant)));
-    const alreadyPresent = existingJids.includes(participantJid);
+    let alreadyPresent = existingJids.includes(participantJid);
     if (!alreadyPresent) {
       const result = await updateParticipantsRaw(client, groupId, [participantJid], 'add');
       if (result.some((item: { status?: string }) => String(item.status) !== '200')) {
-        return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
+        // WhatsApp can answer "bad-request" when the number is already present.
+        // Do one fresh lookup before deciding this is a real add failure.
+        let freshParticipants: any[];
+        if (groupType === 'community') {
+          const freshCommunity = await participatingCommunity(client, groupId, true);
+          if (!freshCommunity) return res.status(404).json({ error: 'whatsapp_community_not_found_after_add' });
+          freshParticipants = freshCommunity.participants || [];
+        } else {
+          const freshGroup = await getGroupMetadata(client, groupId, true);
+          freshParticipants = freshGroup.participants || [];
+        }
+        const freshJids = await Promise.all(freshParticipants.map((participant) => participantPhoneJid(client, participant)));
+        alreadyPresent = freshJids.includes(participantJid);
+        if (!alreadyPresent) return res.status(502).json({ error: 'participant_addition_not_confirmed', result });
+      } else {
+        applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
       }
-      applyParticipantUpdateToCachedGroups({ id: groupId, participants: [participantJid], action: 'add' });
     }
 
-    // A fresh WhatsApp metadata read is the final check. The database is only
-    // activated by the signed participant_added webhook emitted after this.
-    let freshParticipants: any[];
-    if (groupType === 'community') {
-      const freshCommunity = await participatingCommunity(client, groupId, true);
-      if (!freshCommunity) return res.status(404).json({ error: 'whatsapp_community_not_found_after_add' });
-      freshParticipants = freshCommunity.participants || [];
-    } else {
-      const freshGroup = await getGroupMetadata(client, groupId, true);
-      freshParticipants = freshGroup.participants || [];
-    }
-    const freshJids = await Promise.all(freshParticipants.map((participant) => participantPhoneJid(client, participant)));
-    if (!freshJids.includes(participantJid)) {
-      return res.status(502).json({ error: 'participant_not_visible_after_add', added: !alreadyPresent });
-    }
-
+    // The WhatsApp add response or a participant snapshot is the confirmation.
+    // The database still changes to joined only after this signed webhook lands.
     const delivered = await emitWebhook('whatsapp.participant_added', {
       group_id: groupId,
       participant_jid: participantJid,
