@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import { Boom } from '@hapi/boom';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
