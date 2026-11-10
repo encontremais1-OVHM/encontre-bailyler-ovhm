@@ -645,7 +645,7 @@ app.post('/v1/communities/:communityId/participants/:action', async (req, res) =
     return res.status(400).json({ error: 'invalid_participant_id' });
   }
   try {
-    const community = await participatingCommunity(client, req.params.communityId);
+    const community = await participatingCommunity(client, req.params.communityId, true);
     if (!community) return res.status(404).json({ error: 'whatsapp_community_not_found' });
     if (!isConnectedAccountAdmin(community.participants || [], client)) {
       return res.status(403).json({ error: 'bot_must_be_community_admin' });
